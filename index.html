@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Neighborhood Cluster Lasso</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Leaflet CSS -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  />
+  <style>
+    :root { --pad: 10px; --border: 1px solid #e5e7eb; --bg: #f9fafb; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: #fff; }
+    header { padding: 12px var(--pad); border-bottom: var(--border); background: var(--bg); }
+    h1 { margin: 0 0 6px; font-size: 16px; }
+    .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .toolbar > * { margin: 2px 0; }
+    #map { height: calc(100vh - 140px); }
+    .pill { display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border:var(--border); border-radius:999px; background:#fff; }
+    input[type="file"] { padding: 6px; }
+    input[type="text"], select { padding: 6px 10px; border: var(--border); border-radius: 8px; }
+    button { padding: 8px 12px; border-radius: 8px; border: 1px solid #d1d5db; background: #111827; color: #fff; cursor: pointer; }
+    button.secondary { background: #fff; color:#111827; }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .legend { display:flex; gap:8px; flex-wrap:wrap; }
+    .chip { display:inline-flex; align-items:center; gap:6px; padding:4px 8px; border-radius:999px; border:1px solid #e5e7eb; background:#fff; }
+    .dot { width:12px; height:12px; border-radius:50%; border:1px solid #11182733; }
+    footer { padding: 10px var(--pad); border-top: var(--border); background: var(--bg); }
+    .hint { color:#6b7280; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Neighborhood Cluster Lasso</h1>
+    <div class="toolbar">
+      <label class="pill">
+        <strong>1)</strong> Load CSV:
+        <input id="fileInput" type="file" accept=".csv" />
+      </label>
+      <span class="pill">
+        <strong>2)</strong> Lasso:
+        <button id="toggleLasso" class="secondary" disabled>Enable</button>
+        <button id="clearSelection" class="secondary" disabled>Clear Selection</button>
+      </span>
+      <span class="pill">
+        <strong>3)</strong> Label selected:
+        <input id="labelInput" type="text" placeholder="e.g., Foothills East" disabled />
+        <button id="applyLabel" disabled>Apply</button>
+      </span>
+      <span class="pill">
+        <strong>4)</strong> Export:
+        <button id="exportCsv" disabled>Download CSV (+label)</button>
+      </span>
+      <span id="status" class="hint"></span>
+    </div>
+  </header>
+
+  <div id="map"></div>
+
+  <footer>
+    <div class="legend" id="legend"></div>
+    <div class="hint" style="margin-top:6px">
+      Tip: CSV headers can be <code>lat/lon</code>, <code>latitude/longitude</code>, or <code>lat/lng</code>. Other columns (e.g., address, family) are preserved in export.
+    </div>
+  </footer>
+
+  <!-- Leaflet JS -->
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin=""
+  ></script>
+  <!-- leaflet-lasso (UMD build) -->
+  <script src="https://unpkg.com/leaflet-lasso@2.2.13/dist/leaflet-lasso.umd.min.js"></script>
+  <!-- Papa Parse -->
+  <script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
+
+  <script>
+    // --- Map setup (OpenStreetMap tiles; no API key required)
+    const map = L.map('map', { preferCanvas: true }).setView([43.6, -116.2], 8);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution:
+        '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>'
+    }).addTo(map);
+
+    // --- State
+    let rawRows = [];               // original CSV rows (as objects)
+    let markers = [];               // L.circleMarker for each row
+    let idxByLayerId = new Map();   // map layer._leaflet_id -> row index
+    let selectedLayerIds = new Set();
+    let labelByIndex = {};          // index -> label
+    let latKey = null, lonKey = null;
+    const palette = [
+      '#2563eb', '#16a34a', '#f59e0b', '#e11d48', '#0ea5e9', '#a855f7',
+      '#10b981', '#f97316', '#ef4444', '#84cc16', '#14b8a6', '#d946ef'
+    ];
+    const colorByLabel = new Map();
+
+    const statusEl = document.getElementById('status');
+    const legendEl = document.getElementById('legend');
+    const fileInput = document.getElementById('fileInput');
+    const toggleLassoBtn = document.getElementById('toggleLasso');
+    const clearSelectionBtn = document.getElementById('clearSelection');
+    const labelInput = document.getElementById('labelInput');
+    const applyLabelBtn = document.getElementById('applyLabel');
+    const exportBtn = document.getElementById('exportCsv');
+
+    // --- Lasso control
+    const lassoControl = L.control.lasso().addTo(map);
+    map.on('lasso.enabled', () => { toggleLassoBtn.textContent = 'Disable'; });
+    map.on('lasso.disabled', () => { toggleLassoBtn.textContent = 'Enable'; });
+
+    map.on('lasso.finished', (event) => {
+      // event.layers: array of layers inside lasso
+      selectedLayerIds.clear();
+      event.layers.forEach(layer => {
+        selectedLayerIds.add(layer._leaflet_id);
+        highlightLayer(layer, true);
+      });
+      // de-highlight all others
+      markers.forEach(m => {
+        if (!selectedLayerIds.has(m._leaflet_id)) highlightLayer(m, false);
+      });
+      updateStatus(`${selectedLayerIds.size} selected`);
+      updateControls();
+    });
+
+    function enableLasso(enable) {
+      if (enable) lassoControl.enable(); else lassoControl.disable();
+    }
+
+    // --- File loading
+    fileInput.addEventListener('change', (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      resetAll();
+      Papa.parse(file, {
+        header: true,
+        dynamicTyping: true,
+        skipEmptyLines: 'greedy',
+        complete: (res) => {
+          rawRows = res.data || [];
+          if (!rawRows.length) return updateStatus('No rows found.');
+          detectLatLonKeys(rawRows[0]);
+          if (!latKey || !lonKey) {
+            updateStatus('Could not find lat/lon columns. Expected headers like lat/latitude and lon/lng/longitude.');
+            return;
+          }
+          loadExistingLabels();
+          drawRows();
+          fitToData();
+          toggleLassoBtn.disabled = false;
+          labelInput.disabled = false;
+          applyLabelBtn.disabled = false;
+          exportBtn.disabled = false;
+          updateStatus(`Loaded ${rawRows.length} rows.`);
+          updateControls();
+        },
+        error: (err) => updateStatus('CSV parse error: ' + err.message)
+      });
+    });
+
+    function detectLatLonKeys(obj) {
+      const keys = Object.keys(obj);
+      latKey = keys.find(k => /^lat(itude)?$/i.test(k));
+      lonKey = keys.find(k => /^(lon(gitude)?|lng)$/i.test(k));
+    }
+
+    function loadExistingLabels() {
+      // Check if a label column exists in the CSV
+      if (!rawRows.length) return;
+      
+      const firstRow = rawRows[0];
+      const labelKey = Object.keys(firstRow).find(k => /^label$/i.test(k));
+      
+      if (labelKey) {
+        // Apply existing labels from CSV
+        rawRows.forEach((row, idx) => {
+          const label = row[labelKey];
+          if (label && label.toString().trim()) {
+            labelByIndex[idx] = label.toString().trim();
+          }
+        });
+        
+        // Update status to indicate labels were loaded
+        const labelCount = Object.keys(labelByIndex).length;
+        if (labelCount > 0) {
+          setTimeout(() => {
+            updateStatus(`Loaded ${rawRows.length} rows with ${labelCount} existing labels.`);
+          }, 100);
+        }
+      }
+    }
+
+    function createCustomIcon(residents, color) {
+      const size = 24;
+      let symbol = '●'; // default circle
+      
+      // Determine symbol based on resident count
+      if (residents === 1) {
+        symbol = '👤'; // single person
+      } else if (residents === 2) {
+        symbol = '👥'; // couple
+      } else if (residents >= 3) {
+        symbol = '👪'; // family
+      }
+      
+      return L.divIcon({
+        html: `<div style="
+          width: ${size}px; 
+          height: ${size}px; 
+          background-color: ${color}; 
+          border: 2px solid #11182733; 
+          border-radius: 50%; 
+          display: flex; 
+          align-items: center; 
+          justify-content: center; 
+          font-size: 12px;
+          line-height: 1;
+        ">${symbol}</div>`,
+        className: 'custom-household-icon',
+        iconSize: [size, size],
+        iconAnchor: [size/2, size/2]
+      });
+    }
+
+    function drawRows() {
+      // create custom icon markers based on resident count, store index
+      rawRows.forEach((row, idx) => {
+        const lat = Number(row[latKey]);
+        const lon = Number(row[lonKey]);
+        if (Number.isFinite(lat) && Number.isFinite(lon)) {
+          const residents = Number(row.Residents || row.residents) || 1; // default to 1 if missing
+          const icon = createCustomIcon(residents, '#2563eb'); // default color
+          const m = L.marker([lat, lon], { icon }).addTo(map);
+          const title = buildPopup(row);
+          m.bindPopup(title);
+          markers.push(m);
+          idxByLayerId.set(m._leaflet_id, idx);
+        }
+      });
+      refreshColors();
+    }
+
+    function buildPopup(row) {
+      // Show all columns from CSV dynamically
+      const entries = Object.entries(row)
+        .filter(([key, value]) => value !== null && value !== undefined && value !== '')
+        .map(([key, value]) => {
+          const displayKey = key.charAt(0).toUpperCase() + key.slice(1);
+          return `<div><strong>${escapeHtml(displayKey)}:</strong> ${escapeHtml(String(value))}</div>`;
+        });
+      
+      if (entries.length === 0) {
+        return '<div><strong>Household</strong></div>';
+      }
+      
+      return `<div style="max-width: 250px;">${entries.join('')}</div>`;
+    }
+
+    function fitToData() {
+      const latLngs = markers.map(m => m.getLatLng());
+      if (latLngs.length) map.fitBounds(L.latLngBounds(latLngs).pad(0.2));
+    }
+
+    function escapeHtml(s) {
+      return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    // --- Selection & labeling
+    toggleLassoBtn.addEventListener('click', () => {
+      enableLasso(!lassoControl.enabled());
+    });
+    clearSelectionBtn.addEventListener('click', () => {
+      selectedLayerIds.clear();
+      markers.forEach(m => highlightLayer(m, false));
+      updateStatus('Selection cleared');
+      updateControls();
+    });
+    applyLabelBtn.addEventListener('click', () => {
+      const label = labelInput.value.trim();
+      if (!label || selectedLayerIds.size === 0) return;
+      selectedLayerIds.forEach(id => {
+        const idx = idxByLayerId.get(id);
+        if (idx != null) labelByIndex[idx] = label;
+      });
+      // Keep selection but recolor points
+      refreshColors();
+      updateLegend();
+      updateStatus(`Labeled ${selectedLayerIds.size} as “${label}”`);
+      updateControls();
+    });
+
+    function highlightLayer(layer, selected) {
+      const idx = idxByLayerId.get(layer._leaflet_id);
+      const lbl = labelByIndex[idx] || '';
+      const row = rawRows[idx];
+      const residents = Number(row.Residents || row.residents) || 1;
+      const color = colorForLabel(lbl);
+      
+      // Create icon with highlight border
+      const size = 24;
+      let symbol = '●';
+      if (residents === 1) symbol = '👤';
+      else if (residents === 2) symbol = '👥';
+      else if (residents >= 3) symbol = '👪';
+      
+      const highlightIcon = L.divIcon({
+        html: `<div style="
+          width: ${size}px; 
+          height: ${size}px; 
+          background-color: ${color}; 
+          border: ${selected ? '3px' : '2px'} solid ${selected ? '#111827' : '#11182733'}; 
+          border-radius: 50%; 
+          display: flex; 
+          align-items: center; 
+          justify-content: center; 
+          font-size: 12px;
+          line-height: 1;
+          ${selected ? 'box-shadow: 0 0 8px rgba(17, 24, 39, 0.5);' : ''}
+        ">${symbol}</div>`,
+        className: 'custom-household-icon',
+        iconSize: [size, size],
+        iconAnchor: [size/2, size/2]
+      });
+      
+      layer.setIcon(highlightIcon);
+    }
+
+    function colorForLabel(label) {
+      if (!label) return '#2563eb';
+      if (!colorByLabel.has(label)) {
+        const next = palette[colorByLabel.size % palette.length];
+        colorByLabel.set(label, next);
+      }
+      return colorByLabel.get(label);
+    }
+
+    function refreshColors() {
+      markers.forEach(m => {
+        const idx = idxByLayerId.get(m._leaflet_id);
+        const lbl = labelByIndex[idx] || '';
+        const row = rawRows[idx];
+        const residents = Number(row.Residents || row.residents) || 1;
+        const color = colorForLabel(lbl);
+        const newIcon = createCustomIcon(residents, color);
+        m.setIcon(newIcon);
+      });
+      updateLegend();
+    }
+
+    function updateLegend() {
+      legendEl.innerHTML = '';
+      const entries = new Map(); // label -> color
+      // start with assigned colors
+      Array.from(colorByLabel.entries()).forEach(([k,v]) => entries.set(k,v));
+      // ensure default entry visible if any unlabeled points
+      const anyUnlabeled = markers.some(m => {
+        const idx = idxByLayerId.get(m._leaflet_id);
+        return !labelByIndex[idx];
+      });
+      if (anyUnlabeled) entries.set('(unlabeled)', '#2563eb');
+
+      entries.forEach((color, label) => {
+        const div = document.createElement('div');
+        div.className = 'chip';
+        div.innerHTML = `<span class="dot" style="background:${color}"></span>${escapeHtml(label)}`;
+        legendEl.appendChild(div);
+      });
+    }
+
+    function updateControls() {
+      clearSelectionBtn.disabled = selectedLayerIds.size === 0;
+    }
+
+    function updateStatus(msg) { statusEl.textContent = msg; }
+
+    // --- Export CSV (+label column)
+    exportBtn.addEventListener('click', () => {
+      if (!rawRows.length) return;
+      const rows = rawRows.map((r, i) => ({ ...r, label: labelByIndex[i] || '' }));
+      const csv = Papa.unparse(rows, { quotes: false });
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'households_labeled.csv';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    });
+
+    function resetAll() {
+      // clear map layers created earlier
+      markers.forEach(m => m.remove());
+      markers = [];
+      idxByLayerId.clear();
+      selectedLayerIds.clear();
+      labelByIndex = {};
+      colorByLabel.clear();
+      latKey = lonKey = null;
+      legendEl.innerHTML = '';
+      updateStatus('');
+      [toggleLassoBtn, clearSelectionBtn, labelInput, applyLabelBtn, exportBtn].forEach(el => el.disabled = true);
+      labelInput.value = '';
+      if (lassoControl && lassoControl.enabled()) enableLasso(false);
+    }
+  </script>
+</body>
+</html>
