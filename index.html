@@ -46,6 +46,12 @@
     #zoneTableWrap th { position: sticky; top: 0; background: #fff; border-bottom: 1px solid #e5e7eb; }
     #zoneTableWrap tbody tr { cursor: pointer; }
     #zoneTableWrap tbody tr:hover { background: #f9fafb; }
+    #dlOverlay { position: fixed; inset: 0; background: rgba(17,24,39,.45); z-index: 3000; display: none; align-items: center; justify-content: center; }
+    #dlOverlay.open { display: flex; }
+    .dl-box { background: #fff; border-radius: 12px; padding: 16px; width: min(420px, 92vw); max-height: 80vh; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 8px 24px rgba(17,24,39,.25); }
+    #dlCols { overflow: auto; display: flex; flex-direction: column; gap: 6px; padding: 2px; }
+    #dlCols label { display: flex; gap: 8px; align-items: center; cursor: pointer; }
+    .dl-actions { display: flex; gap: 8px; justify-content: flex-end; }
   </style>
 </head>
 <body>
@@ -69,6 +75,7 @@
       <span class="pill">
         <strong>4)</strong> Export:
         <button id="exportCsv" disabled>Download CSV (+label)</button>
+        <button id="downloadSelected" class="secondary" disabled>Download selected…</button>
       </span>
       <span class="pill">
         Evac zones:
@@ -79,6 +86,19 @@
   </header>
 
   <div id="map"></div>
+
+  <div id="dlOverlay">
+    <div class="dl-box">
+      <strong>Download selected households</strong>
+      <div id="dlCount" class="hint"></div>
+      <div class="hint">Choose columns to include:</div>
+      <div id="dlCols"></div>
+      <div class="dl-actions">
+        <button id="dlCancel" class="secondary">Cancel</button>
+        <button id="dlConfirm">Download CSV</button>
+      </div>
+    </div>
+  </div>
 
   <div id="zonePanel">
     <div class="panel-head">
@@ -149,6 +169,13 @@
     const zonePanelClose = document.getElementById('zonePanelClose');
     const zoneChipsEl = document.getElementById('zoneChips');
     const zoneTableWrap = document.getElementById('zoneTableWrap');
+    const downloadSelectedBtn = document.getElementById('downloadSelected');
+    const dlOverlay = document.getElementById('dlOverlay');
+    const dlCount = document.getElementById('dlCount');
+    const dlColsEl = document.getElementById('dlCols');
+    const dlConfirmBtn = document.getElementById('dlConfirm');
+    const dlCancelBtn = document.getElementById('dlCancel');
+    let lastChosenCols = null; // remember column picks between downloads this session
 
     // --- Lasso control
     const lassoControl = L.control.lasso().addTo(map);
@@ -267,6 +294,7 @@
     });
 
     function updateZonePanel() {
+      updateControls(); // zone selection affects the Download selected button
       if (selectedZoneNames.size === 0) {
         zonePanel.classList.remove('open');
         return;
@@ -605,7 +633,90 @@
 
     function updateControls() {
       clearSelectionBtn.disabled = selectedLayerIds.size === 0;
+      downloadSelectedBtn.disabled = getSelectionIndices().length === 0;
     }
+
+    // --- Download selected households (lasso selection and/or selected zones)
+    function getSelectionIndices() {
+      const set = new Set();
+      selectedLayerIds.forEach(id => {
+        const idx = idxByLayerId.get(id);
+        if (idx != null) set.add(idx);
+      });
+      if (selectedZoneNames.size) {
+        rawRows.forEach((row, idx) => {
+          const z = zoneForIndex(idx);
+          if (z && selectedZoneNames.has(z)) set.add(idx);
+        });
+      }
+      return Array.from(set).sort((a, b) => a - b);
+    }
+
+    function downloadableColumns() {
+      const cols = rawRows.length ? Object.keys(rawRows[0]) : [];
+      ['label', 'evac_zone'].forEach(c => { if (!cols.includes(c)) cols.push(c); });
+      return cols;
+    }
+
+    downloadSelectedBtn.addEventListener('click', () => {
+      const sel = getSelectionIndices();
+      if (!sel.length) return;
+      const cols = downloadableColumns();
+      const defaults = lastChosenCols
+        || new Set(cols.filter(c => /name|household/i.test(c) || /phone|tel|mobile|cell/i.test(c)));
+      dlColsEl.innerHTML = '';
+      cols.forEach(c => {
+        const label = document.createElement('label');
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.value = c;
+        cb.checked = defaults.has(c);
+        label.appendChild(cb);
+        label.appendChild(document.createTextNode(c));
+        dlColsEl.appendChild(label);
+      });
+      const zoneCount = selectedZoneNames.size;
+      const lassoCount = selectedLayerIds.size;
+      const parts = [];
+      if (lassoCount) parts.push(`lasso: ${lassoCount}`);
+      if (zoneCount) parts.push(`${zoneCount} zone${zoneCount === 1 ? '' : 's'}`);
+      dlCount.textContent = `${sel.length} household${sel.length === 1 ? '' : 's'} selected (${parts.join(' + ')})`;
+      dlOverlay.classList.add('open');
+    });
+
+    dlCancelBtn.addEventListener('click', () => dlOverlay.classList.remove('open'));
+    dlOverlay.addEventListener('click', (e) => {
+      if (e.target === dlOverlay) dlOverlay.classList.remove('open');
+    });
+
+    dlConfirmBtn.addEventListener('click', () => {
+      const chosen = Array.from(dlColsEl.querySelectorAll('input:checked')).map(cb => cb.value);
+      if (!chosen.length) { updateStatus('Pick at least one column.'); return; }
+      lastChosenCols = new Set(chosen);
+      const sel = getSelectionIndices();
+      const rows = sel.map(i => {
+        const out = {};
+        chosen.forEach(c => {
+          if (c === 'label') out[c] = labelByIndex[i] || '';
+          else if (c === 'evac_zone') out[c] = zoneForIndex(i);
+          else out[c] = rawRows[i][c] ?? '';
+        });
+        return out;
+      });
+      const csv = Papa.unparse(rows, { columns: chosen });
+      const stamp = new Date().toISOString().slice(0, 16).replace('T', '_').replace(':', '');
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `dispatch_households_${stamp}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      dlOverlay.classList.remove('open');
+      updateStatus(`Downloaded ${rows.length} households (${chosen.length} columns).`);
+    });
 
     function updateStatus(msg) { statusEl.textContent = msg; }
 
@@ -638,7 +749,8 @@
       latKey = lonKey = null;
       legendEl.innerHTML = '';
       updateStatus('');
-      [toggleLassoBtn, clearSelectionBtn, labelInput, applyLabelBtn, exportBtn].forEach(el => el.disabled = true);
+      [toggleLassoBtn, clearSelectionBtn, labelInput, applyLabelBtn, exportBtn, downloadSelectedBtn].forEach(el => el.disabled = true);
+      dlOverlay.classList.remove('open');
       labelInput.value = '';
       if (lassoControl && lassoControl.enabled()) enableLasso(false);
       updateZonePanel();

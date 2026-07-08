@@ -40,6 +40,7 @@ An interactive web application for geographic clustering and labeling of househo
 - **Auto-label loading**: Automatically applies existing labels if CSV contains a `label` column
 - **Data preservation**: All original CSV columns are maintained and displayed
 - **Enhanced export**: Download labeled data as CSV with new `label` and `evac_zone` columns
+- **Dispatch download**: "Download selected…" exports just the households in the current lasso selection and/or selected evac zones, with a column picker (defaults to name and phone) for quick call lists
 
 ## Usage
 
