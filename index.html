@@ -52,6 +52,11 @@
     #dlCols { overflow: auto; display: flex; flex-direction: column; gap: 6px; padding: 2px; }
     #dlCols label { display: flex; gap: 8px; align-items: center; cursor: pointer; }
     .dl-actions { display: flex; gap: 8px; justify-content: flex-end; }
+    #alertBanner { position: fixed; top: 0; left: 50%; transform: translateX(-50%); z-index: 2500; background: #b91c1c; color: #fff; padding: 8px 16px; border-radius: 0 0 12px 12px; box-shadow: 0 4px 12px rgba(0,0,0,.3); display: none; max-width: 92vw; font-weight: 600; }
+    #alertBanner.open { display: block; }
+    #alertBanner .zone-alert { cursor: pointer; text-decoration: underline; margin: 0 4px; white-space: nowrap; }
+    .zone-label-alert { color: #b91c1c; font-size: 11px; }
+    .fire-icon { filter: drop-shadow(0 0 3px #fff); font-size: 22px; text-align: center; }
   </style>
 </head>
 <body>
@@ -81,6 +86,10 @@
         Evac zones:
         <button id="toggleZones" class="secondary" disabled>Show</button>
       </span>
+      <span class="pill">
+        Fires:
+        <button id="toggleFires" class="secondary">Hide</button>
+      </span>
       <span id="status" class="hint"></span>
     </div>
   </header>
@@ -109,8 +118,11 @@
     <div id="zoneTableWrap"></div>
   </div>
 
+  <div id="alertBanner"></div>
+
   <footer>
     <div class="legend" id="legend"></div>
+    <div id="liveStatus" class="hint" style="margin-top:6px"></div>
     <div class="hint" style="margin-top:6px">
       Tip: CSV headers can be <code>lat/lon</code>, <code>latitude/longitude</code>, or <code>lat/lng</code>. Other columns (e.g., address, family) are preserved in export.
     </div>
@@ -149,6 +161,13 @@
     const selectedZoneNames = new Set();   // zones highlighted by clicking
     const zoneLayerByName = new Map();     // zone name -> polygon layer (for restyling)
     let markerByIdx = new Map();           // row index -> marker
+    let suspectByIndex = new Set();        // rows sharing identical coords (likely geocoder fallback)
+    let adaZonesLayer = null;              // Ada County zones (Genasys snapshot)
+    const adaMetaByZone = new Map();       // 'ADA-xxxx' -> {name, status, color, lat, lon}
+    const awareStatusByZone = new Map();   // 'ADA-xxxx' -> live {status, color, updatedAt, desc}
+    let firesLayer = null, perimetersLayer = null;
+    let firePoints = [];                   // [{lon, lat, name}] for live-status lookups
+    let lastFireUpdate = null, lastStatusUpdate = null, pollBusy = false;
     const palette = [
       '#2563eb', '#16a34a', '#f59e0b', '#e11d48', '#0ea5e9', '#a855f7',
       '#10b981', '#f97316', '#ef4444', '#84cc16', '#14b8a6', '#d946ef'
@@ -227,15 +246,227 @@
       .catch(err => updateStatus('Evacuation zones unavailable: ' + err.message));
 
     toggleZonesBtn.addEventListener('click', () => {
-      if (!zonesLayer) return;
-      if (map.hasLayer(zonesLayer)) {
-        map.removeLayer(zonesLayer);
-        toggleZonesBtn.textContent = 'Show';
-      } else {
-        zonesLayer.addTo(map);
-        toggleZonesBtn.textContent = 'Hide';
-      }
+      if (!zonesLayer && !adaZonesLayer) return;
+      const showing = (zonesLayer && map.hasLayer(zonesLayer)) || (adaZonesLayer && map.hasLayer(adaZonesLayer));
+      [zonesLayer, adaZonesLayer].forEach(l => {
+        if (!l) return;
+        if (showing) map.removeLayer(l); else l.addTo(map);
+      });
+      toggleZonesBtn.textContent = showing ? 'Show' : 'Hide';
     });
+
+    // --- Ada County zones (Genasys Protect snapshot; see data/README.md)
+    fetch('data/ada_county_evacuation_zones.geojson')
+      .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(geojson => {
+        geojson.features.forEach(f => {
+          const p = f.properties;
+          adaMetaByZone.set(p.zone, p);
+          const polys = f.geometry.type === 'MultiPolygon' ? f.geometry.coordinates : [f.geometry.coordinates];
+          zoneFeatures.push({ name: p.zone, polys, bbox: bboxOfPolys(polys) });
+        });
+        zoneByIndex = {}; // recompute: Ada households can now match
+        adaZonesLayer = L.geoJSON(geojson, {
+          style: f => zoneStyle(f.properties.zone),
+          onEachFeature: (f, layer) => {
+            const zn = f.properties.zone;
+            zoneLayerByName.set(zn, layer);
+            const nice = f.properties.name ? `${zn} · ${f.properties.name}` : zn;
+            layer.bindTooltip(nice, { sticky: true });
+            layer.on('click', () => toggleZoneSelection(zn));
+          }
+        }).addTo(map);
+        if (markers.length) refreshColors(); // re-evaluate no-zone warnings
+        startLivePolling();
+      })
+      .catch(err => updateStatus('Ada County zones unavailable: ' + err.message));
+
+    // --- Live zone status via Genasys aware API (keyless, official surface).
+    // Only Ada County zones have live status; we poll zones containing loaded
+    // households plus zones at active fire locations, every 60s.
+    const AWARE_URL = 'https://api-aware.zonehaven.com/v2/zone?coordinates=';
+    let pollTimer = null;
+
+    function startLivePolling() {
+      if (pollTimer) return;
+      pollLiveStatus();
+      pollTimer = setInterval(pollLiveStatus, 60000);
+    }
+
+    function watchedPoints() {
+      const pts = new Map(); // key -> [lon, lat]
+      rawRows.forEach((row, idx) => {
+        const z = zoneForIndex(idx);
+        if (z && z.startsWith('ADA-') && !pts.has(z)) {
+          const lat = parseFloat(row[latKey]), lon = parseFloat(row[lonKey]);
+          if (Number.isFinite(lat) && Number.isFinite(lon)) pts.set(z, [lon, lat]);
+        }
+      });
+      awareStatusByZone.forEach((v, z) => {  // keep watching zones already non-Normal
+        if (!/normal/i.test(v.status) && !pts.has(z)) {
+          const meta = adaMetaByZone.get(z);
+          if (meta && meta.lon && meta.lat) pts.set(z, [Number(meta.lon), Number(meta.lat)]);
+        }
+      });
+      firePoints.forEach((f, i) => pts.set('fire-' + i, [f.lon, f.lat]));
+      return Array.from(pts.values()).slice(0, 40);
+    }
+
+    async function pollLiveStatus() {
+      if (pollBusy || !adaMetaByZone.size) return;
+      pollBusy = true;
+      let checked = 0, errors = 0;
+      try {
+        for (const [lon, lat] of watchedPoints()) {
+          try {
+            const r = await fetch(AWARE_URL + lon + ',' + lat);
+            if (r.status === 404) { checked++; continue; } // point has no Genasys zone
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            const zone = ((await r.json()).zones || [])[0];
+            checked++;
+            if (zone && zone.identifier) {
+              const short = zone.identifier.replace('US-ID-ADA-', '');
+              awareStatusByZone.set(short, {
+                status: zone.status || 'Normal',
+                color: zone.statusColor || '#F2F2F2',
+                updatedAt: zone.updatedAt,
+                desc: zone.statusDescription || ''
+              });
+              restyleAdaZone(short);
+            }
+          } catch (e) { errors++; }
+          await new Promise(res => setTimeout(res, 150)); // be polite
+        }
+      } finally {
+        pollBusy = false;
+        lastStatusUpdate = { time: new Date(), checked, errors };
+        updateLiveStatusLine();
+        updateAlertBanner();
+      }
+    }
+
+    function nonNormalZones() {
+      const out = [];
+      awareStatusByZone.forEach((v, z) => { if (!/normal/i.test(v.status)) out.push({ zone: z, ...v }); });
+      adaMetaByZone.forEach((m, z) => {     // snapshot statuses, unless live data supersedes
+        if (!awareStatusByZone.has(z) && !/normal/i.test(m.status)) out.push({ zone: z, status: m.status, color: m.color });
+      });
+      return out;
+    }
+
+    function restyleAdaZone(zn) {
+      const layer = zoneLayerByName.get(zn);
+      if (!layer) return;
+      layer.setStyle(zoneStyle(zn));
+      const live = awareStatusByZone.get(zn);
+      const alerted = live && !/normal/i.test(live.status);
+      if (alerted && !layer._alertLabel) {
+        layer._alertLabel = true;
+        layer.unbindTooltip();
+        layer.bindTooltip(`${zn} · ${live.status}`, { permanent: true, direction: 'center', className: 'zone-label zone-label-alert' });
+        layer.bringToFront();
+      } else if (!alerted && layer._alertLabel) {
+        layer._alertLabel = false;
+        layer.unbindTooltip();
+        const meta = adaMetaByZone.get(zn) || {};
+        layer.bindTooltip(meta.name ? `${zn} · ${meta.name}` : zn, { sticky: true });
+      }
+    }
+
+    function updateAlertBanner() {
+      const banner = document.getElementById('alertBanner');
+      const alerts = nonNormalZones();
+      if (!alerts.length) { banner.classList.remove('open'); return; }
+      banner.innerHTML = '🚨 ';
+      alerts.forEach(a => {
+        const meta = adaMetaByZone.get(a.zone) || {};
+        let households = 0;
+        rawRows.forEach((row, idx) => { if (zoneForIndex(idx) === a.zone) households++; });
+        const el = document.createElement('span');
+        el.className = 'zone-alert';
+        el.textContent = `${a.zone}${meta.name ? ' (' + meta.name + ')' : ''}: ${a.status}` + (households ? ` · ${households} households` : '');
+        el.addEventListener('click', () => {
+          if (!selectedZoneNames.has(a.zone)) toggleZoneSelection(a.zone);
+          const layer = zoneLayerByName.get(a.zone);
+          if (layer) map.fitBounds(layer.getBounds().pad(0.3));
+        });
+        banner.appendChild(el);
+      });
+      banner.classList.add('open');
+    }
+
+    function updateLiveStatusLine() {
+      const el = document.getElementById('liveStatus');
+      const bits = [];
+      if (lastStatusUpdate) {
+        const t = lastStatusUpdate.time.toLocaleTimeString();
+        bits.push(`Zone status: ${lastStatusUpdate.checked} point${lastStatusUpdate.checked === 1 ? '' : 's'} checked at ${t}` +
+          (lastStatusUpdate.errors ? ` (${lastStatusUpdate.errors} errors)` : '') +
+          ` · ${nonNormalZones().length} non-Normal · Ada County live via Genasys; Boise County static`);
+      }
+      if (lastFireUpdate) {
+        bits.push(`Fires: ${firePoints.length} active in Idaho (NIFC, updated ${lastFireUpdate.toLocaleTimeString()})`);
+      }
+      el.textContent = bits.join(' · ');
+    }
+
+    // --- Active fires overlay (NIFC WFIGS, public)
+    const WFIGS = 'https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/';
+    const FIRES_URL = WFIGS + 'WFIGS_Incident_Locations_Current/FeatureServer/0/query?where=' +
+      encodeURIComponent("POOState='US-ID' AND IncidentTypeCategory='WF'") +
+      '&outFields=IncidentName,IncidentSize,PercentContained,FireDiscoveryDateTime,ModifiedOnDateTime_dt,IrwinID&f=geojson';
+    const PERIMS_URL = WFIGS + 'WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query?where=' +
+      encodeURIComponent("attr_POOState='US-ID'") + '&outFields=attr_IncidentName,poly_GISAcres&f=geojson';
+
+    async function refreshFires() {
+      try {
+        const [pts, perims] = await Promise.all([
+          fetch(FIRES_URL).then(r => r.json()),
+          fetch(PERIMS_URL).then(r => r.json())
+        ]);
+        if (firesLayer) firesLayer.remove();
+        if (perimetersLayer) perimetersLayer.remove();
+        firePoints = (pts.features || []).map(f => ({
+          lon: f.geometry.coordinates[0], lat: f.geometry.coordinates[1], name: f.properties.IncidentName
+        }));
+        firesLayer = L.layerGroup((pts.features || []).map(f => {
+          const p = f.properties;
+          const [lon, lat] = f.geometry.coordinates;
+          const m = L.marker([lat, lon], {
+            icon: L.divIcon({ html: '🔥', className: 'fire-icon', iconSize: [26, 26], iconAnchor: [13, 13] })
+          });
+          const disc = p.FireDiscoveryDateTime ? new Date(p.FireDiscoveryDateTime).toLocaleString() : '?';
+          m.bindPopup(`<div style="max-width:250px">
+            <div><strong>🔥 ${escapeHtml(p.IncidentName || 'Fire')}</strong></div>
+            <div><strong>Size:</strong> ${escapeHtml(String(p.IncidentSize ?? '?'))} acres</div>
+            <div><strong>Contained:</strong> ${escapeHtml(String(p.PercentContained ?? '?'))}%</div>
+            <div><strong>Discovered:</strong> ${escapeHtml(disc)}</div>
+          </div>`);
+          return m;
+        }));
+        perimetersLayer = L.geoJSON(perims, {
+          style: { color: '#b91c1c', weight: 2, dashArray: '4 3', fillColor: '#b91c1c', fillOpacity: 0.08 },
+          onEachFeature: (f, layer) => layer.bindTooltip(`${f.properties.attr_IncidentName || 'Fire'} perimeter`, { sticky: true })
+        });
+        if (toggleFiresBtn.textContent === 'Hide') { firesLayer.addTo(map); perimetersLayer.addTo(map); }
+        lastFireUpdate = new Date();
+        updateLiveStatusLine();
+      } catch (e) {
+        updateStatus('Fire data unavailable: ' + e.message);
+      }
+    }
+
+    const toggleFiresBtn = document.getElementById('toggleFires');
+    toggleFiresBtn.addEventListener('click', () => {
+      const showing = firesLayer && map.hasLayer(firesLayer);
+      [firesLayer, perimetersLayer].forEach(l => {
+        if (!l) return;
+        if (showing) map.removeLayer(l); else l.addTo(map);
+      });
+      toggleFiresBtn.textContent = showing ? 'Show' : 'Hide';
+    });
+    refreshFires();
+    setInterval(refreshFires, 300000);
 
     function zoneName(props) {
       return (props && (props.Zone || props.Name)) || 'Zone';
@@ -250,8 +481,19 @@
     }
 
     function zoneStyle(name) {
-      const color = zoneColor(name);
       const selected = selectedZoneNames.has(name);
+      if (adaMetaByZone.has(name)) {
+        // Ada zones: styled by live/snapshot status, subtle when Normal
+        const live = awareStatusByZone.get(name);
+        const meta = adaMetaByZone.get(name);
+        const status = live ? live.status : meta.status;
+        const statusColor = (live && live.color) || meta.color || '#F2F2F2';
+        const normal = /normal/i.test(status);
+        if (!normal) return { color: '#7f1d1d', weight: selected ? 4 : 3, fillColor: statusColor, fillOpacity: 0.45 };
+        if (selected) return { color: '#111827', weight: 3, fillColor: '#9ca3af', fillOpacity: 0.35 };
+        return { color: '#9ca3af', weight: 1, fillColor: '#9ca3af', fillOpacity: 0.04 };
+      }
+      const color = zoneColor(name);
       return {
         color: selected ? '#111827' : color,
         weight: selected ? 3 : 1.5,
@@ -378,8 +620,8 @@
       if (idx == null || !zoneFeatures.length) return '';
       if (!(idx in zoneByIndex)) {
         const row = rawRows[idx];
-        const lat = Number(row?.[latKey]);
-        const lon = Number(row?.[lonKey]);
+        const lat = parseFloat(row?.[latKey]);
+        const lon = parseFloat(row?.[lonKey]);
         zoneByIndex[idx] = (Number.isFinite(lat) && Number.isFinite(lon)) ? zoneForPoint(lat, lon) : '';
       }
       return zoneByIndex[idx];
@@ -448,47 +690,68 @@
       }
     }
 
-    function createCustomIcon(residents, color) {
+    // Rows that share identical coordinates with another row are almost always
+    // geocoder fallbacks (city/state/ZIP centroids) — flag them as suspect.
+    function computeSuspects() {
+      suspectByIndex = new Set();
+      const byCoord = new Map();
+      rawRows.forEach((row, idx) => {
+        const lat = parseFloat(row[latKey]), lon = parseFloat(row[lonKey]);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+        const key = lat + ',' + lon;
+        if (!byCoord.has(key)) byCoord.set(key, []);
+        byCoord.get(key).push(idx);
+      });
+      byCoord.forEach(list => {
+        if (list.length > 1) list.forEach(idx => suspectByIndex.add(idx));
+      });
+    }
+
+    function iconFor(idx, selected) {
+      const row = rawRows[idx];
+      const residents = Number(row.Residents || row.residents) || 1;
+      const color = colorForLabel(labelByIndex[idx] || '');
       const size = 24;
-      let symbol = '●'; // default circle
-      
-      // Determine symbol based on resident count
-      if (residents === 1) {
-        symbol = '👤'; // single person
-      } else if (residents === 2) {
-        symbol = '👥'; // couple
-      } else if (residents >= 3) {
-        symbol = '👪'; // family
-      }
-      
+      let symbol = '●';
+      if (residents === 1) symbol = '👤';
+      else if (residents === 2) symbol = '👥';
+      else if (residents >= 3) symbol = '👪';
+
+      const suspect = suspectByIndex.has(idx);
+      const noZone = !suspect && zoneFeatures.length && !zoneForIndex(idx);
+      let border = selected ? '3px solid #111827' : '2px solid #11182733';
+      if (suspect) border = '3px dashed #dc2626';
+      else if (noZone) border = '3px dashed #d97706';
+
       return L.divIcon({
         html: `<div style="
-          width: ${size}px; 
-          height: ${size}px; 
-          background-color: ${color}; 
-          border: 2px solid #11182733; 
-          border-radius: 50%; 
-          display: flex; 
-          align-items: center; 
-          justify-content: center; 
+          width: ${size}px;
+          height: ${size}px;
+          background-color: ${color};
+          border: ${border};
+          border-radius: 50%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
           font-size: 12px;
           line-height: 1;
+          ${selected ? 'box-shadow: 0 0 8px rgba(17, 24, 39, 0.5);' : ''}
         ">${symbol}</div>`,
         className: 'custom-household-icon',
         iconSize: [size, size],
-        iconAnchor: [size/2, size/2]
+        iconAnchor: [size / 2, size / 2]
       });
     }
 
     function drawRows() {
       // create custom icon markers based on resident count, store index
+      computeSuspects();
       rawRows.forEach((row, idx) => {
-        const lat = Number(row[latKey]);
-        const lon = Number(row[lonKey]);
+        // parseFloat (not Number): empty/null coords must NOT coerce to 0,0
+        const lat = parseFloat(row[latKey]);
+        const lon = parseFloat(row[lonKey]);
         if (Number.isFinite(lat) && Number.isFinite(lon)) {
-          const residents = Number(row.Residents || row.residents) || 1; // default to 1 if missing
-          const icon = createCustomIcon(residents, '#2563eb'); // default color
-          const m = L.marker([lat, lon], { icon }).addTo(map);
+          const m = L.marker([lat, lon], { icon: iconFor(idx, false) }).addTo(map);
           m.bindPopup(() => buildPopup(row, idx)); // built at click time so evac zone is current
           markers.push(m);
           idxByLayerId.set(m._leaflet_id, idx);
@@ -497,6 +760,7 @@
       });
       refreshColors();
       updateZonePanel();
+      if (adaMetaByZone.size) pollLiveStatus(); // new households -> new watched zones
     }
 
     function buildPopup(row, idx) {
@@ -555,38 +819,7 @@
     function highlightLayer(layer, selected) {
       const idx = idxByLayerId.get(layer._leaflet_id);
       if (idx == null) return;
-      const lbl = labelByIndex[idx] || '';
-      const row = rawRows[idx];
-      const residents = Number(row.Residents || row.residents) || 1;
-      const color = colorForLabel(lbl);
-      
-      // Create icon with highlight border
-      const size = 24;
-      let symbol = '●';
-      if (residents === 1) symbol = '👤';
-      else if (residents === 2) symbol = '👥';
-      else if (residents >= 3) symbol = '👪';
-      
-      const highlightIcon = L.divIcon({
-        html: `<div style="
-          width: ${size}px; 
-          height: ${size}px; 
-          background-color: ${color}; 
-          border: ${selected ? '3px' : '2px'} solid ${selected ? '#111827' : '#11182733'}; 
-          border-radius: 50%; 
-          display: flex; 
-          align-items: center; 
-          justify-content: center; 
-          font-size: 12px;
-          line-height: 1;
-          ${selected ? 'box-shadow: 0 0 8px rgba(17, 24, 39, 0.5);' : ''}
-        ">${symbol}</div>`,
-        className: 'custom-household-icon',
-        iconSize: [size, size],
-        iconAnchor: [size/2, size/2]
-      });
-      
-      layer.setIcon(highlightIcon);
+      layer.setIcon(iconFor(idx, selected));
     }
 
     function colorForLabel(label) {
@@ -601,12 +834,7 @@
     function refreshColors() {
       markers.forEach(m => {
         const idx = idxByLayerId.get(m._leaflet_id);
-        const lbl = labelByIndex[idx] || '';
-        const row = rawRows[idx];
-        const residents = Number(row.Residents || row.residents) || 1;
-        const color = colorForLabel(lbl);
-        const newIcon = createCustomIcon(residents, color);
-        m.setIcon(newIcon);
+        m.setIcon(iconFor(idx, selectedLayerIds.has(m._leaflet_id)));
       });
       updateLegend();
     }
@@ -629,6 +857,28 @@
         div.innerHTML = `<span class="dot" style="background:${color}"></span>${escapeHtml(label)}`;
         legendEl.appendChild(div);
       });
+
+      // Data-quality warnings
+      if (rawRows.length) {
+        const noCoord = rawRows.length - markers.length;
+        let noZone = 0;
+        if (zoneFeatures.length) {
+          markers.forEach(m => {
+            const idx = idxByLayerId.get(m._leaflet_id);
+            if (!suspectByIndex.has(idx) && !zoneForIndex(idx)) noZone++;
+          });
+        }
+        const warn = (text, bg) => {
+          const div = document.createElement('div');
+          div.className = 'chip';
+          div.style.background = bg;
+          div.textContent = text;
+          legendEl.appendChild(div);
+        };
+        if (suspectByIndex.size) warn(`⚠️ suspect geocode: ${suspectByIndex.size} (duplicate coords)`, '#fee2e2');
+        if (noZone) warn(`🟠 no evac zone: ${noZone}`, '#ffedd5');
+        if (noCoord) warn(`✖ no coordinates: ${noCoord} (not on map)`, '#f3f4f6');
+      }
     }
 
     function updateControls() {
@@ -745,6 +995,7 @@
       selectedLayerIds.clear();
       labelByIndex = {};
       zoneByIndex = {};
+      suspectByIndex = new Set();
       colorByLabel.clear();
       latKey = lonKey = null;
       legendEl.innerHTML = '';
@@ -754,6 +1005,7 @@
       labelInput.value = '';
       if (lassoControl && lassoControl.enabled()) enableLasso(false);
       updateZonePanel();
+      updateAlertBanner();
     }
   </script>
 </body>

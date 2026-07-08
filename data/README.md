@@ -20,3 +20,26 @@ curl -s "https://services3.arcgis.com/5dR74OZF27kwYZJF/arcgis/rest/services/ID_B
 ```
 
 The same feature service also has a layer 2 (`County Boundary`) if the county outline is ever needed.
+
+## ada_county_evacuation_zones.geojson
+
+Snapshot of all 542 Ada County, Idaho evacuation zones from the Genasys Protect (Zonehaven) GeoServer WFS, normalized to properties `zone` (e.g. `ADA-2256`), `name` (commonly known as), `status`, `color`, `lat`, `lon` (centroid), coordinates rounded to 5 decimals, EPSG:4326.
+
+- **Downloaded**: 2026-07-07
+- **Live status**: the app does NOT rely on this snapshot for status - it polls the keyless Genasys aware API (`https://api-aware.zonehaven.com/v2/zone?coordinates=lng,lat`, CORS-enabled) for zones containing loaded households and zones at active fire locations. The snapshot provides geometry only (plus a status fallback).
+- **Why a snapshot**: the WFS itself is origin-allowlisted to `protect.genasys.com`, so browsers cannot call it directly; geometry changes rarely, status is fetched live.
+
+To refresh the snapshot (server-side only; HTTP Basic credentials are the ones Genasys ships in plaintext in their public web bundle - unofficial, may rotate):
+
+```bash
+curl -s -u 'ui-client:QceJ62zsY4fb' "https://cdngeospatialcei.zonehaven.com/geoserver/zonehavenv2/wfs?service=WFS&version=2.0.0&request=GetFeature&typeNames=zonehavenv2:evacuation_zone&outputFormat=application/json&srsName=EPSG:4326&cql_filter=identifer%20LIKE%20%27US-ID-ADA%25%27" -o ada_raw.json
+# then normalize props/precision as in the properties list above
+```
+
+Note the WFS field is genuinely spelled `identifer`. Boise County is NOT in the public Genasys feed (verified 2026-07-07); for live Boise County status, ask Boise County Emergency Management for an official `zms.zonehaven.com` authkey WMS.
+
+## Fire data
+
+Active Idaho wildfires and perimeters come live from NIFC WFIGS (public ArcGIS, no auth, polled every 5 min by the app):
+- Points: `WFIGS_Incident_Locations_Current` layer 0, `where=POOState='US-ID' AND IncidentTypeCategory='WF'`
+- Perimeters: `WFIGS_Interagency_Perimeters_Current` layer 0, `where=attr_POOState='US-ID'`
