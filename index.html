@@ -31,6 +31,21 @@
     .dot { width:12px; height:12px; border-radius:50%; border:1px solid #11182733; }
     footer { padding: 10px var(--pad); border-top: var(--border); background: var(--bg); }
     .hint { color:#6b7280; }
+    .zone-label { background: transparent; border: none; box-shadow: none; font-weight: 700; font-size: 10px; color: #111827; text-shadow: 0 0 3px #fff, 0 0 3px #fff, 0 0 3px #fff; pointer-events: none; }
+    .zone-label::before { display: none; }
+    #zonePanel { position: fixed; right: 12px; width: min(560px, 92vw); max-height: 62vh; background: #fff; border: var(--border); border-radius: 12px; box-shadow: 0 8px 24px rgba(17,24,39,.18); z-index: 2000; display: none; flex-direction: column; overflow: hidden; }
+    #zonePanel.open { display: flex; }
+    #zonePanel .panel-head { display: flex; align-items: center; padding: 10px 12px; border-bottom: var(--border); background: var(--bg); }
+    #zonePanel .panel-head strong { flex: 1; }
+    #zonePanel .panel-head button { padding: 4px 10px; }
+    #zoneChips { display: flex; gap: 6px; flex-wrap: wrap; padding: 8px 12px; }
+    #zoneChips .chip { cursor: pointer; }
+    #zoneTableWrap { overflow: auto; }
+    #zoneTableWrap table { border-collapse: collapse; width: 100%; font-size: 12px; }
+    #zoneTableWrap th, #zoneTableWrap td { padding: 6px 8px; border-bottom: 1px solid #f3f4f6; text-align: left; white-space: nowrap; }
+    #zoneTableWrap th { position: sticky; top: 0; background: #fff; border-bottom: 1px solid #e5e7eb; }
+    #zoneTableWrap tbody tr { cursor: pointer; }
+    #zoneTableWrap tbody tr:hover { background: #f9fafb; }
   </style>
 </head>
 <body>
@@ -64,6 +79,15 @@
   </header>
 
   <div id="map"></div>
+
+  <div id="zonePanel">
+    <div class="panel-head">
+      <strong id="zonePanelTitle">Selected zones</strong>
+      <button id="zonePanelClose" class="secondary" title="Clear zone selection">✕</button>
+    </div>
+    <div id="zoneChips"></div>
+    <div id="zoneTableWrap"></div>
+  </div>
 
   <footer>
     <div class="legend" id="legend"></div>
@@ -102,6 +126,9 @@
     let zonesLayer = null;          // L.geoJSON overlay of evacuation zones
     let zoneFeatures = [];          // [{name, polys, bbox}] for point-in-polygon lookup
     const zoneColorByPrefix = new Map();
+    const selectedZoneNames = new Set();   // zones highlighted by clicking
+    const zoneLayerByName = new Map();     // zone name -> polygon layer (for restyling)
+    let markerByIdx = new Map();           // row index -> marker
     const palette = [
       '#2563eb', '#16a34a', '#f59e0b', '#e11d48', '#0ea5e9', '#a855f7',
       '#10b981', '#f97316', '#ef4444', '#84cc16', '#14b8a6', '#d946ef'
@@ -117,6 +144,11 @@
     const applyLabelBtn = document.getElementById('applyLabel');
     const exportBtn = document.getElementById('exportCsv');
     const toggleZonesBtn = document.getElementById('toggleZones');
+    const zonePanel = document.getElementById('zonePanel');
+    const zonePanelTitle = document.getElementById('zonePanelTitle');
+    const zonePanelClose = document.getElementById('zonePanelClose');
+    const zoneChipsEl = document.getElementById('zoneChips');
+    const zoneTableWrap = document.getElementById('zoneTableWrap');
 
     // --- Lasso control
     const lassoControl = L.control.lasso().addTo(map);
@@ -153,13 +185,12 @@
         });
         zoneByIndex = {}; // recompute now that zones are known
         zonesLayer = L.geoJSON(geojson, {
-          style: f => {
-            const color = zoneColor(zoneName(f.properties));
-            return { color, weight: 1.5, fillColor: color, fillOpacity: 0.12 };
-          },
+          style: f => zoneStyle(zoneName(f.properties)),
           onEachFeature: (f, layer) => {
-            layer.bindTooltip(zoneName(f.properties), { sticky: true });
-            layer.bindPopup(zonePopup(f.properties || {}));
+            const name = zoneName(f.properties);
+            zoneLayerByName.set(name, layer);
+            layer.bindTooltip(name, { permanent: true, direction: 'center', className: 'zone-label' });
+            layer.on('click', () => toggleZoneSelection(name));
           }
         }).addTo(map);
         toggleZonesBtn.disabled = false;
@@ -191,13 +222,94 @@
       return zoneColorByPrefix.get(prefix);
     }
 
-    function zonePopup(p) {
-      const lines = [`<div><strong>Evacuation zone:</strong> ${escapeHtml(zoneName(p))}</div>`];
-      if (p.Label) lines.push(`<div><strong>Label:</strong> ${escapeHtml(String(p.Label))}</div>`);
-      if (p.Jurisdiction) lines.push(`<div><strong>Jurisdiction:</strong> ${escapeHtml(String(p.Jurisdiction))}</div>`);
-      if (p.PopulationWithin != null) lines.push(`<div><strong>Population:</strong> ${escapeHtml(String(p.PopulationWithin))}</div>`);
-      if (p.StructuresWithin) lines.push(`<div><strong>Structures:</strong> ${escapeHtml(String(p.StructuresWithin))}</div>`);
-      return `<div>${lines.join('')}</div>`;
+    function zoneStyle(name) {
+      const color = zoneColor(name);
+      const selected = selectedZoneNames.has(name);
+      return {
+        color: selected ? '#111827' : color,
+        weight: selected ? 3 : 1.5,
+        fillColor: color,
+        fillOpacity: selected ? 0.35 : 0.12
+      };
+    }
+
+    function toggleZoneSelection(name) {
+      if (selectedZoneNames.has(name)) {
+        selectedZoneNames.delete(name);
+      } else {
+        selectedZoneNames.add(name);
+      }
+      const layer = zoneLayerByName.get(name);
+      if (layer) {
+        layer.setStyle(zoneStyle(name));
+        if (selectedZoneNames.has(name)) layer.bringToFront();
+      }
+      updateZonePanel();
+    }
+
+    zonePanelClose.addEventListener('click', () => {
+      Array.from(selectedZoneNames).forEach(name => {
+        selectedZoneNames.delete(name);
+        const layer = zoneLayerByName.get(name);
+        if (layer) layer.setStyle(zoneStyle(name));
+      });
+      updateZonePanel();
+    });
+
+    zoneTableWrap.addEventListener('click', (e) => {
+      const tr = e.target.closest('tr[data-idx]');
+      if (!tr) return;
+      const m = markerByIdx.get(Number(tr.dataset.idx));
+      if (m) {
+        map.panTo(m.getLatLng());
+        m.openPopup();
+      }
+    });
+
+    function updateZonePanel() {
+      if (selectedZoneNames.size === 0) {
+        zonePanel.classList.remove('open');
+        return;
+      }
+      zonePanel.classList.add('open');
+      zonePanel.style.top = (document.getElementById('map').getBoundingClientRect().top + 12) + 'px';
+
+      const inZones = [];
+      rawRows.forEach((row, idx) => {
+        const z = zoneForIndex(idx);
+        if (z && selectedZoneNames.has(z)) inZones.push({ row, idx, z });
+      });
+
+      const nz = selectedZoneNames.size, nh = inZones.length;
+      zonePanelTitle.textContent = `${nz} zone${nz === 1 ? '' : 's'} selected · ${nh} household${nh === 1 ? '' : 's'}`;
+
+      zoneChipsEl.innerHTML = '';
+      Array.from(selectedZoneNames).sort().forEach(name => {
+        const count = inZones.filter(x => x.z === name).length;
+        const chip = document.createElement('span');
+        chip.className = 'chip';
+        chip.title = 'Click to deselect';
+        chip.innerHTML = `<span class="dot" style="background:${zoneColor(name)}"></span>${escapeHtml(name)} (${count}) ✕`;
+        chip.addEventListener('click', () => toggleZoneSelection(name));
+        zoneChipsEl.appendChild(chip);
+      });
+
+      if (!rawRows.length) {
+        zoneTableWrap.innerHTML = '<div class="hint" style="padding:12px">No household CSV loaded yet.</div>';
+        return;
+      }
+      if (!inZones.length) {
+        zoneTableWrap.innerHTML = '<div class="hint" style="padding:12px">No households in the selected zones.</div>';
+        return;
+      }
+      const cols = Object.keys(rawRows[0]);
+      const header = ['Zone', ...cols.map(c => c.charAt(0).toUpperCase() + c.slice(1)), 'Label']
+        .map(c => `<th>${escapeHtml(c)}</th>`).join('');
+      const body = inZones.map(({ row, idx, z }) => {
+        const tds = cols.map(c => `<td>${escapeHtml(row[c] == null ? '' : String(row[c]))}</td>`).join('');
+        return `<tr data-idx="${idx}"><td>${escapeHtml(z)}</td>${tds}<td>${escapeHtml(labelByIndex[idx] || '')}</td></tr>`;
+      }).join('');
+      zoneTableWrap.innerHTML = `<table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`;
     }
 
     function bboxOfPolys(polys) {
@@ -352,9 +464,11 @@
           m.bindPopup(() => buildPopup(row, idx)); // built at click time so evac zone is current
           markers.push(m);
           idxByLayerId.set(m._leaflet_id, idx);
+          markerByIdx.set(idx, m);
         }
       });
       refreshColors();
+      updateZonePanel();
     }
 
     function buildPopup(row, idx) {
@@ -405,6 +519,7 @@
       // Keep selection but recolor points
       refreshColors();
       updateLegend();
+      updateZonePanel();
       updateStatus(`Labeled ${selectedLayerIds.size} as “${label}”`);
       updateControls();
     });
@@ -515,6 +630,7 @@
       markers.forEach(m => m.remove());
       markers = [];
       idxByLayerId.clear();
+      markerByIdx.clear();
       selectedLayerIds.clear();
       labelByIndex = {};
       zoneByIndex = {};
@@ -525,6 +641,7 @@
       [toggleLassoBtn, clearSelectionBtn, labelInput, applyLabelBtn, exportBtn].forEach(el => el.disabled = true);
       labelInput.value = '';
       if (lassoControl && lassoControl.enabled()) enableLasso(false);
+      updateZonePanel();
     }
   </script>
 </body>

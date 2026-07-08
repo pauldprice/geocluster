@@ -28,7 +28,9 @@ An interactive web application for geographic clustering and labeling of househo
 ### 🚨 Evacuation Zones
 - **Boise County, Idaho zones**: 106 official evacuation zone polygons (same zones used by Genasys Protect and Watch Duty), rendered as a map overlay
 - **Toggleable overlay**: Show or hide zones with the "Evac zones" button; zones are colored by community (Garden Valley, Idaho City, Horseshoe Bend, etc.)
-- **Zone details**: Hover a zone for its code, click for details
+- **Always-visible labels**: Every zone shows its code (e.g. `IC-01`) directly on the map
+- **Click to highlight**: Click zones to select them (click again to deselect); selected zones are emphasized and a panel pops out listing every household inside them, with per-zone counts
+- **Household table**: The panel table shows all CSV columns plus zone and label; click a row to pan to that household and open its popup
 - **Automatic assignment**: Each household is matched to its evacuation zone (point-in-polygon); the zone shows in the household popup and is included in the CSV export as an `evac_zone` column
 - **Data source**: See `data/README.md` for the ArcGIS feature service and how to refresh the data
 
