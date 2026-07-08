@@ -36,7 +36,17 @@ curl -s -u 'ui-client:QceJ62zsY4fb' "https://cdngeospatialcei.zonehaven.com/geos
 # then normalize props/precision as in the properties list above
 ```
 
-Note the WFS field is genuinely spelled `identifer`. Boise County is NOT in the public Genasys feed (verified 2026-07-07); for live Boise County status, ask Boise County Emergency Management for an official `zms.zonehaven.com` authkey WMS.
+Note the WFS field is genuinely spelled `identifer`. Boise County is NOT in the public Genasys feed (verified 2026-07-07).
+
+## Boise County LIVE status (Ready/Set/Go)
+
+Boise County publishes live per-zone readiness on their own ArcGIS org (public, CORS `*`, no auth), actively edited during incidents. The app polls this every 60s and highlights any zone whose `Readiness` is not `None`:
+
+```
+https://services6.arcgis.com/GtUQURjsVQCZqPXM/arcgis/rest/services/Evac_Zones/FeatureServer/0/query?where=1=1&outFields=Zone,Readiness&returnGeometry=false&f=json
+```
+
+`Readiness` values: `None`, `Ready` (green #85E71D), `Set` (yellow #FCEC0A), `Go` (red #CC1714) - colors from the county's own renderer. `Zone` values match `boise_county_evacuation_zones.geojson` exactly (e.g. `RC-06`). Discovered via the county's public lookup app (item `fb26e037e233400f948a7c3364a61993` -> webmap `ce6e6ca0927a4bdbb0b566ca15955e78`). This service also carries the zone geometry itself and could replace the static snapshot if it diverges.
 
 ## Fire data
 

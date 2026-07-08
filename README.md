@@ -32,6 +32,7 @@ An interactive web application for geographic clustering and labeling of househo
 - **Click to highlight**: Click zones to select them (click again to deselect); selected zones are emphasized and a panel pops out listing every household inside them, with per-zone counts
 - **Household table**: The panel table shows all CSV columns plus zone and label; click a row to pan to that household and open its popup
 - **Automatic assignment**: Each household is matched to its evacuation zone (point-in-polygon); the zone shows in the household popup and is included in the CSV export as an `evac_zone` column
+- **Boise County live status**: the county's official Ready/Set/Go readiness is polled every 60s from Boise County's ArcGIS service; zones under any evacuation level auto-highlight in the county's colors (green/yellow/red) with status labels and alert-banner entries
 - **Ada County live status**: 542 Ada County zones (Genasys Protect) with live evacuation status polled every 60s for zones containing your households and zones at fire locations; non-Normal zones turn status-colored with an alert banner (click it to jump to the zone)
 - **Active fires**: Idaho wildfire locations and perimeters from NIFC, refreshed every 5 minutes, with a "Fires" toggle
 - **Satellite fire footprints**: NASA FIRMS (VIIRS) thermal detections rendered as red footprint polygons over the burn area, age-banded (bright red <24h, darker as detections age to 96h) - shows the active fire area even before an official perimeter is published

@@ -165,6 +165,10 @@
     let adaZonesLayer = null;              // Ada County zones (Genasys snapshot)
     const adaMetaByZone = new Map();       // 'ADA-xxxx' -> {name, status, color, lat, lon}
     const awareStatusByZone = new Map();   // 'ADA-xxxx' -> live {status, color, updatedAt, desc}
+    const boiseReadinessByZone = new Map(); // 'RC-06' -> 'None'|'Ready'|'Set'|'Go' (county ArcGIS, live)
+    // Boise County's own Ready/Set/Go renderer colors
+    const READINESS_COLORS = { Ready: '#85e71d', Set: '#fcec0a', Go: '#cc1714' };
+    const READINESS_LABELS = { Ready: 'READY – be aware', Set: 'SET – be ready to leave', Go: 'GO – evacuate now' };
     let firesLayer = null, perimetersLayer = null, satLayer = null;
     let firePoints = [];                   // [{lon, lat, name}] for live-status lookups
     let satStats = null;                   // {count, newestHours} for the status line
@@ -243,6 +247,7 @@
         toggleZonesBtn.disabled = false;
         toggleZonesBtn.textContent = 'Hide';
         if (!statusEl.textContent) updateStatus(`${zoneFeatures.length} evacuation zones loaded.`);
+        startLivePolling(); // Boise readiness polls even if the Ada layer fails
       })
       .catch(err => updateStatus('Evacuation zones unavailable: ' + err.message));
 
@@ -313,11 +318,46 @@
       return Array.from(pts.values()).slice(0, 40);
     }
 
+    // Boise County publishes live Ready/Set/Go per zone on their own ArcGIS org
+    const BOISE_READINESS_URL = 'https://services6.arcgis.com/GtUQURjsVQCZqPXM/arcgis/rest/services/' +
+      'Evac_Zones/FeatureServer/0/query?where=1%3D1&outFields=Zone,Readiness&returnGeometry=false&f=json';
+
+    function restyleBoiseZone(zn) {
+      const layer = zoneLayerByName.get(zn);
+      if (!layer || adaMetaByZone.has(zn)) return;
+      layer.setStyle(zoneStyle(zn));
+      const rd = boiseReadinessByZone.get(zn) || 'None';
+      const alerted = rd !== 'None';
+      if (alerted) {
+        layer.unbindTooltip();
+        layer.bindTooltip(`${zn} · ${rd.toUpperCase()}`, { permanent: true, direction: 'center', className: 'zone-label zone-label-alert' });
+        layer.bringToFront();
+      } else if (layer._wasAlerted) {
+        layer.unbindTooltip();
+        layer.bindTooltip(zn, { permanent: true, direction: 'center', className: 'zone-label' });
+      }
+      layer._wasAlerted = alerted;
+    }
+
+    async function pollBoiseReadiness() {
+      const r = await fetch(BOISE_READINESS_URL);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      ((await r.json()).features || []).forEach(f => {
+        const zn = f.attributes.Zone;
+        const rd = f.attributes.Readiness || 'None';
+        if (boiseReadinessByZone.get(zn) !== rd) {
+          boiseReadinessByZone.set(zn, rd);
+          restyleBoiseZone(zn);
+        }
+      });
+    }
+
     async function pollLiveStatus() {
-      if (pollBusy || !adaMetaByZone.size) return;
+      if (pollBusy) return;
       pollBusy = true;
       let checked = 0, errors = 0;
       try {
+        try { await pollBoiseReadiness(); checked++; } catch (e) { errors++; }
         for (const [lon, lat] of watchedPoints()) {
           try {
             const r = await fetch(AWARE_URL + lon + ',' + lat);
@@ -351,6 +391,9 @@
       awareStatusByZone.forEach((v, z) => { if (!/normal/i.test(v.status)) out.push({ zone: z, ...v }); });
       adaMetaByZone.forEach((m, z) => {     // snapshot statuses, unless live data supersedes
         if (!awareStatusByZone.has(z) && !/normal/i.test(m.status)) out.push({ zone: z, status: m.status, color: m.color });
+      });
+      boiseReadinessByZone.forEach((rd, z) => {  // Boise County Ready/Set/Go
+        if (rd && rd !== 'None') out.push({ zone: z, status: READINESS_LABELS[rd] || rd, color: READINESS_COLORS[rd] });
       });
       return out;
     }
@@ -403,7 +446,7 @@
         const t = lastStatusUpdate.time.toLocaleTimeString();
         bits.push(`Zone status: ${lastStatusUpdate.checked} point${lastStatusUpdate.checked === 1 ? '' : 's'} checked at ${t}` +
           (lastStatusUpdate.errors ? ` (${lastStatusUpdate.errors} errors)` : '') +
-          ` · ${nonNormalZones().length} non-Normal · Ada County live via Genasys; Boise County static`);
+          ` · ${nonNormalZones().length} zones alerted · Boise County live via county ArcGIS (Ready/Set/Go), Ada County live via Genasys`);
       }
       if (lastFireUpdate) {
         let fire = `Fires: ${firePoints.length} active in Idaho (NIFC, updated ${lastFireUpdate.toLocaleTimeString()})`;
@@ -535,6 +578,15 @@
         if (!normal) return { color: '#7f1d1d', weight: selected ? 4 : 3, fillColor: statusColor, fillOpacity: 0.45 };
         if (selected) return { color: '#111827', weight: 3, fillColor: '#9ca3af', fillOpacity: 0.35 };
         return { color: '#9ca3af', weight: 1, fillColor: '#9ca3af', fillOpacity: 0.04 };
+      }
+      const readiness = boiseReadinessByZone.get(name);
+      if (readiness && readiness !== 'None') {
+        return {
+          color: selected ? '#111827' : '#7f1d1d',
+          weight: selected ? 4 : 3,
+          fillColor: READINESS_COLORS[readiness] || '#cc1714',
+          fillOpacity: 0.5
+        };
       }
       const color = zoneColor(name);
       return {
