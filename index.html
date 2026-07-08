@@ -55,6 +55,10 @@
         <strong>4)</strong> Export:
         <button id="exportCsv" disabled>Download CSV (+label)</button>
       </span>
+      <span class="pill">
+        Evac zones:
+        <button id="toggleZones" class="secondary" disabled>Show</button>
+      </span>
       <span id="status" class="hint"></span>
     </div>
   </header>
@@ -93,7 +97,11 @@
     let idxByLayerId = new Map();   // map layer._leaflet_id -> row index
     let selectedLayerIds = new Set();
     let labelByIndex = {};          // index -> label
+    let zoneByIndex = {};           // index -> evacuation zone name (computed, cached)
     let latKey = null, lonKey = null;
+    let zonesLayer = null;          // L.geoJSON overlay of evacuation zones
+    let zoneFeatures = [];          // [{name, polys, bbox}] for point-in-polygon lookup
+    const zoneColorByPrefix = new Map();
     const palette = [
       '#2563eb', '#16a34a', '#f59e0b', '#e11d48', '#0ea5e9', '#a855f7',
       '#10b981', '#f97316', '#ef4444', '#84cc16', '#14b8a6', '#d946ef'
@@ -108,6 +116,7 @@
     const labelInput = document.getElementById('labelInput');
     const applyLabelBtn = document.getElementById('applyLabel');
     const exportBtn = document.getElementById('exportCsv');
+    const toggleZonesBtn = document.getElementById('toggleZones');
 
     // --- Lasso control
     const lassoControl = L.control.lasso().addTo(map);
@@ -118,6 +127,7 @@
       // event.layers: array of layers inside lasso
       selectedLayerIds.clear();
       event.layers.forEach(layer => {
+        if (!idxByLayerId.has(layer._leaflet_id)) return; // ignore zone polygons etc.
         selectedLayerIds.add(layer._leaflet_id);
         highlightLayer(layer, true);
       });
@@ -131,6 +141,108 @@
 
     function enableLasso(enable) {
       if (enable) lassoControl.enable(); else lassoControl.disable();
+    }
+
+    // --- Evacuation zones overlay (see data/README.md for the source)
+    fetch('data/boise_county_evacuation_zones.geojson')
+      .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(geojson => {
+        zoneFeatures = geojson.features.map(f => {
+          const polys = f.geometry.type === 'MultiPolygon' ? f.geometry.coordinates : [f.geometry.coordinates];
+          return { name: zoneName(f.properties), polys, bbox: bboxOfPolys(polys) };
+        });
+        zoneByIndex = {}; // recompute now that zones are known
+        zonesLayer = L.geoJSON(geojson, {
+          style: f => {
+            const color = zoneColor(zoneName(f.properties));
+            return { color, weight: 1.5, fillColor: color, fillOpacity: 0.12 };
+          },
+          onEachFeature: (f, layer) => {
+            layer.bindTooltip(zoneName(f.properties), { sticky: true });
+            layer.bindPopup(zonePopup(f.properties || {}));
+          }
+        }).addTo(map);
+        toggleZonesBtn.disabled = false;
+        toggleZonesBtn.textContent = 'Hide';
+        if (!statusEl.textContent) updateStatus(`${zoneFeatures.length} evacuation zones loaded.`);
+      })
+      .catch(err => updateStatus('Evacuation zones unavailable: ' + err.message));
+
+    toggleZonesBtn.addEventListener('click', () => {
+      if (!zonesLayer) return;
+      if (map.hasLayer(zonesLayer)) {
+        map.removeLayer(zonesLayer);
+        toggleZonesBtn.textContent = 'Show';
+      } else {
+        zonesLayer.addTo(map);
+        toggleZonesBtn.textContent = 'Hide';
+      }
+    });
+
+    function zoneName(props) {
+      return (props && (props.Zone || props.Name)) || 'Zone';
+    }
+
+    function zoneColor(name) {
+      const prefix = name.split('-')[0];
+      if (!zoneColorByPrefix.has(prefix)) {
+        zoneColorByPrefix.set(prefix, palette[zoneColorByPrefix.size % palette.length]);
+      }
+      return zoneColorByPrefix.get(prefix);
+    }
+
+    function zonePopup(p) {
+      const lines = [`<div><strong>Evacuation zone:</strong> ${escapeHtml(zoneName(p))}</div>`];
+      if (p.Label) lines.push(`<div><strong>Label:</strong> ${escapeHtml(String(p.Label))}</div>`);
+      if (p.Jurisdiction) lines.push(`<div><strong>Jurisdiction:</strong> ${escapeHtml(String(p.Jurisdiction))}</div>`);
+      if (p.PopulationWithin != null) lines.push(`<div><strong>Population:</strong> ${escapeHtml(String(p.PopulationWithin))}</div>`);
+      if (p.StructuresWithin) lines.push(`<div><strong>Structures:</strong> ${escapeHtml(String(p.StructuresWithin))}</div>`);
+      return `<div>${lines.join('')}</div>`;
+    }
+
+    function bboxOfPolys(polys) {
+      let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+      polys.forEach(rings => rings.forEach(ring => ring.forEach(([x, y]) => {
+        if (x < minx) minx = x; if (x > maxx) maxx = x;
+        if (y < miny) miny = y; if (y > maxy) maxy = y;
+      })));
+      return [minx, miny, maxx, maxy];
+    }
+
+    // Ray-casting point-in-ring test (ring is [[lon,lat], ...])
+    function pointInRing(lon, lat, ring) {
+      let inside = false;
+      for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+        const xi = ring[i][0], yi = ring[i][1], xj = ring[j][0], yj = ring[j][1];
+        if (((yi > lat) !== (yj > lat)) && (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi)) {
+          inside = !inside;
+        }
+      }
+      return inside;
+    }
+
+    function zoneForPoint(lat, lon) {
+      for (const z of zoneFeatures) {
+        const [minx, miny, maxx, maxy] = z.bbox;
+        if (lon < minx || lon > maxx || lat < miny || lat > maxy) continue;
+        for (const rings of z.polys) {
+          if (pointInRing(lon, lat, rings[0]) && !rings.slice(1).some(hole => pointInRing(lon, lat, hole))) {
+            return z.name;
+          }
+        }
+      }
+      return '';
+    }
+
+    function zoneForIndex(idx) {
+      if (idx == null || !zoneFeatures.length) return '';
+      if (!(idx in zoneByIndex)) {
+        const row = rawRows[idx];
+        const lat = Number(row?.[latKey]);
+        const lon = Number(row?.[lonKey]);
+        zoneByIndex[idx] = (Number.isFinite(lat) && Number.isFinite(lon)) ? zoneForPoint(lat, lon) : '';
+      }
+      return zoneByIndex[idx];
     }
 
     // --- File loading
@@ -237,8 +349,7 @@
           const residents = Number(row.Residents || row.residents) || 1; // default to 1 if missing
           const icon = createCustomIcon(residents, '#2563eb'); // default color
           const m = L.marker([lat, lon], { icon }).addTo(map);
-          const title = buildPopup(row);
-          m.bindPopup(title);
+          m.bindPopup(() => buildPopup(row, idx)); // built at click time so evac zone is current
           markers.push(m);
           idxByLayerId.set(m._leaflet_id, idx);
         }
@@ -246,7 +357,7 @@
       refreshColors();
     }
 
-    function buildPopup(row) {
+    function buildPopup(row, idx) {
       // Show all columns from CSV dynamically
       const entries = Object.entries(row)
         .filter(([key, value]) => value !== null && value !== undefined && value !== '')
@@ -254,11 +365,14 @@
           const displayKey = key.charAt(0).toUpperCase() + key.slice(1);
           return `<div><strong>${escapeHtml(displayKey)}:</strong> ${escapeHtml(String(value))}</div>`;
         });
-      
+
+      const zone = zoneForIndex(idx);
+      if (zone) entries.push(`<div><strong>Evac zone:</strong> ${escapeHtml(zone)}</div>`);
+
       if (entries.length === 0) {
         return '<div><strong>Household</strong></div>';
       }
-      
+
       return `<div style="max-width: 250px;">${entries.join('')}</div>`;
     }
 
@@ -297,6 +411,7 @@
 
     function highlightLayer(layer, selected) {
       const idx = idxByLayerId.get(layer._leaflet_id);
+      if (idx == null) return;
       const lbl = labelByIndex[idx] || '';
       const row = rawRows[idx];
       const residents = Number(row.Residents || row.residents) || 1;
@@ -382,7 +497,7 @@
     // --- Export CSV (+label column)
     exportBtn.addEventListener('click', () => {
       if (!rawRows.length) return;
-      const rows = rawRows.map((r, i) => ({ ...r, label: labelByIndex[i] || '' }));
+      const rows = rawRows.map((r, i) => ({ ...r, label: labelByIndex[i] || '', evac_zone: zoneForIndex(i) }));
       const csv = Papa.unparse(rows, { quotes: false });
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
       const url = URL.createObjectURL(blob);
@@ -402,6 +517,7 @@
       idxByLayerId.clear();
       selectedLayerIds.clear();
       labelByIndex = {};
+      zoneByIndex = {};
       colorByLabel.clear();
       latKey = lonKey = null;
       legendEl.innerHTML = '';

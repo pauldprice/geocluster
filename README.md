@@ -25,12 +25,19 @@ An interactive web application for geographic clustering and labeling of househo
 - **Auto-legend**: Dynamically generated legend shows all active labels
 - **Persistent labels**: Labels are preserved during export
 
+### 🚨 Evacuation Zones
+- **Boise County, Idaho zones**: 106 official evacuation zone polygons (same zones used by Genasys Protect and Watch Duty), rendered as a map overlay
+- **Toggleable overlay**: Show or hide zones with the "Evac zones" button; zones are colored by community (Garden Valley, Idaho City, Horseshoe Bend, etc.)
+- **Zone details**: Hover a zone for its code, click for details
+- **Automatic assignment**: Each household is matched to its evacuation zone (point-in-polygon); the zone shows in the household popup and is included in the CSV export as an `evac_zone` column
+- **Data source**: See `data/README.md` for the ArcGIS feature service and how to refresh the data
+
 ### 📊 Data Management
 - **CSV import**: Supports standard CSV files with lat/lon coordinates
 - **Flexible headers**: Accepts `lat/latitude` and `lon/lng/longitude` variations
 - **Auto-label loading**: Automatically applies existing labels if CSV contains a `label` column
 - **Data preservation**: All original CSV columns are maintained and displayed
-- **Enhanced export**: Download labeled data as CSV with new label column
+- **Enhanced export**: Download labeled data as CSV with new `label` and `evac_zone` columns
 
 ## Usage
 
