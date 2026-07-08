@@ -165,8 +165,9 @@
     let adaZonesLayer = null;              // Ada County zones (Genasys snapshot)
     const adaMetaByZone = new Map();       // 'ADA-xxxx' -> {name, status, color, lat, lon}
     const awareStatusByZone = new Map();   // 'ADA-xxxx' -> live {status, color, updatedAt, desc}
-    let firesLayer = null, perimetersLayer = null;
+    let firesLayer = null, perimetersLayer = null, satLayer = null;
     let firePoints = [];                   // [{lon, lat, name}] for live-status lookups
+    let satStats = null;                   // {count, newestHours} for the status line
     let lastFireUpdate = null, lastStatusUpdate = null, pollBusy = false;
     const palette = [
       '#2563eb', '#16a34a', '#f59e0b', '#e11d48', '#0ea5e9', '#a855f7',
@@ -405,7 +406,10 @@
           ` · ${nonNormalZones().length} non-Normal · Ada County live via Genasys; Boise County static`);
       }
       if (lastFireUpdate) {
-        bits.push(`Fires: ${firePoints.length} active in Idaho (NIFC, updated ${lastFireUpdate.toLocaleTimeString()})`);
+        let fire = `Fires: ${firePoints.length} active in Idaho (NIFC, updated ${lastFireUpdate.toLocaleTimeString()})`;
+        if (satStats) fire += ` · ${satStats.count} satellite detections ≤96h` +
+          (satStats.count ? `, newest ${satStats.newestHours}h ago (NASA FIRMS)` : ' (NASA FIRMS)');
+        bits.push(fire);
       }
       el.textContent = bits.join(' · ');
     }
@@ -417,15 +421,50 @@
       '&outFields=IncidentName,IncidentSize,PercentContained,FireDiscoveryDateTime,ModifiedOnDateTime_dt,IrwinID&f=geojson';
     const PERIMS_URL = WFIGS + 'WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query?where=' +
       encodeURIComponent("attr_POOState='US-ID'") + '&outFields=attr_IncidentName,poly_GISAcres&f=geojson';
+    // NASA FIRMS VIIRS thermal detections via Esri Living Atlas (keyless, CORS-open).
+    // Point data with scan/track pixel dimensions (km); footprints synthesized below.
+    const VIIRS_URL = 'https://services9.arcgis.com/RHVPKKiFTONKtxq3/arcgis/rest/services/' +
+      'Satellite_VIIRS_Thermal_Hotspots_and_Fire_Activity/FeatureServer/0/query' +
+      '?where=' + encodeURIComponent('hours_old<=96') +
+      '&geometry=-117.25,41.98,-111.04,49.01&geometryType=esriGeometryEnvelope&inSR=4326' +
+      '&spatialRel=esriSpatialRelIntersects' +
+      '&outFields=satellite,confidence,frp,scan,track,hours_old&f=geojson';
+
+    // WFCA-style age banding for detection footprints
+    function detectionStyle(hoursOld) {
+      if (hoursOld <= 24) return { color: '#b40808', weight: 1.5, fillColor: '#d60a0a', fillOpacity: 0.6 };
+      if (hoursOld <= 48) return { color: '#963214', weight: 1, fillColor: '#ba3f18', fillOpacity: 0.45 };
+      return { color: '#533720', weight: 1, fillColor: '#674528', fillOpacity: 0.3 };
+    }
+
+    function buildSatLayer(geojson) {
+      const rects = (geojson.features || []).map(f => {
+        const p = f.properties;
+        const [lon, lat] = f.geometry.coordinates;
+        // scan/track are the satellite pixel dimensions in km
+        const dLat = (Number(p.track) || 0.375) / 2 / 110.54;
+        const dLon = (Number(p.scan) || 0.375) / 2 / (111.32 * Math.cos(lat * Math.PI / 180));
+        const r = L.rectangle([[lat - dLat, lon - dLon], [lat + dLat, lon + dLon]], detectionStyle(p.hours_old));
+        r.bindTooltip(`Satellite detection · ${escapeHtml(String(p.satellite || '?'))} · ` +
+          `${p.hours_old}h ago · FRP ${p.frp ?? '?'} · ${escapeHtml(String(p.confidence || ''))}`, { sticky: true });
+        return r;
+      });
+      const hours = (geojson.features || []).map(f => f.properties.hours_old).filter(h => h != null);
+      satStats = { count: rects.length, newestHours: hours.length ? Math.min(...hours) : null };
+      return L.layerGroup(rects);
+    }
 
     async function refreshFires() {
       try {
-        const [pts, perims] = await Promise.all([
+        const [pts, perims, viirs] = await Promise.all([
           fetch(FIRES_URL).then(r => r.json()),
-          fetch(PERIMS_URL).then(r => r.json())
+          fetch(PERIMS_URL).then(r => r.json()),
+          fetch(VIIRS_URL).then(r => r.json()).catch(() => null)
         ]);
         if (firesLayer) firesLayer.remove();
         if (perimetersLayer) perimetersLayer.remove();
+        if (satLayer) satLayer.remove();
+        satLayer = viirs ? buildSatLayer(viirs) : null;
         firePoints = (pts.features || []).map(f => ({
           lon: f.geometry.coordinates[0], lat: f.geometry.coordinates[1], name: f.properties.IncidentName
         }));
@@ -448,7 +487,11 @@
           style: { color: '#b91c1c', weight: 2, dashArray: '4 3', fillColor: '#b91c1c', fillOpacity: 0.08 },
           onEachFeature: (f, layer) => layer.bindTooltip(`${f.properties.attr_IncidentName || 'Fire'} perimeter`, { sticky: true })
         });
-        if (toggleFiresBtn.textContent === 'Hide') { firesLayer.addTo(map); perimetersLayer.addTo(map); }
+        if (toggleFiresBtn.textContent === 'Hide') {
+          if (satLayer) satLayer.addTo(map); // under the markers
+          firesLayer.addTo(map);
+          perimetersLayer.addTo(map);
+        }
         lastFireUpdate = new Date();
         updateLiveStatusLine();
       } catch (e) {
@@ -459,7 +502,7 @@
     const toggleFiresBtn = document.getElementById('toggleFires');
     toggleFiresBtn.addEventListener('click', () => {
       const showing = firesLayer && map.hasLayer(firesLayer);
-      [firesLayer, perimetersLayer].forEach(l => {
+      [firesLayer, perimetersLayer, satLayer].forEach(l => {
         if (!l) return;
         if (showing) map.removeLayer(l); else l.addTo(map);
       });
