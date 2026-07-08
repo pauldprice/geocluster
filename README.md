@@ -77,15 +77,17 @@ Your CSV should include:
 
 ## Development
 
-To run locally:
+TypeScript + React + Vite. Leaflet is driven imperatively by a typed `MapController` (src/map/controller.ts); React renders the UI chrome from a small observable store (src/store.ts).
+
 ```bash
-# Serve with any HTTP server
-python -m http.server 8000
-# or
-npx serve .
+npm install
+npm run dev      # dev server with hot reload
+npm test         # vitest unit tests (geo math, CSV handling)
+npm run build    # typecheck + build single-file dist/index.html
+npm run preview  # serve the built file
 ```
 
-Then open http://localhost:8000 in your browser.
+The build produces ONE self-contained `dist/index.html` (~3 MB) with the app, both zone datasets, and all dependencies inlined - it runs from `file://` or a USB stick with no server (live feeds still need a network). Deploys to GitHub Pages via `.github/workflows/deploy.yml` on push to main.
 
 ## License
 
