@@ -146,6 +146,9 @@
   <script>
     // --- Map setup (OpenStreetMap tiles; no API key required)
     const map = L.map('map', { preferCanvas: true }).setView([43.6, -116.2], 8);
+    // GOES pixels render in their own pane between the base tiles (200) and
+    // the overlay pane (400) so they always sit under zones and VIIRS.
+    map.createPane('goesPane').style.zIndex = 350;
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       attribution:
         '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>'
@@ -494,20 +497,28 @@
       return (Date.now() - ts) / 3600000;
     }
 
-    function goesStyle(h) { // light translucent orange: coarse 2km pixels, advisory only
-      if (h <= 2) return { color: '#f97316', opacity: 0.4, weight: 1, fillColor: '#fdba74', fillOpacity: 0.18 };
-      return { color: '#fdba74', opacity: 0.3, weight: 1, fillColor: '#fed7aa', fillOpacity: 0.10 };
+    function goesStyle(h) { // faint translucent orange: coarse 2km pixels, advisory only
+      if (h <= 2) return { pane: 'goesPane', color: '#f97316', opacity: 0.25, weight: 1, fillColor: '#fdba74', fillOpacity: 0.10 };
+      return { pane: 'goesPane', color: '#fdba74', opacity: 0.15, weight: 1, fillColor: '#fed7aa', fillOpacity: 0.05 };
     }
 
     function buildGoesLayer(geojson) {
-      const rects = [];
-      let newest = Infinity;
+      // Repeat scans stack the same ~2km pixels dozens of times; keep only the
+      // newest detection per grid cell so the faint opacity stays faint.
+      const byCell = new Map();
       (geojson.features || []).forEach(f => {
         const p = f.properties;
         const h = hmsAgeHours(p);
         if (!Number.isFinite(h) || h > 6) return; // GOES is for recency; VIIRS covers history
-        newest = Math.min(newest, h);
         const [lon, lat] = f.geometry.coordinates;
+        const key = Math.round(lat / 0.02) + ',' + Math.round(lon / 0.02);
+        const cur = byCell.get(key);
+        if (!cur || h < cur.h) byCell.set(key, { lat, lon, h, p });
+      });
+      const rects = [];
+      let newest = Infinity;
+      byCell.forEach(({ lat, lon, h, p }) => {
+        newest = Math.min(newest, h);
         const dLat = 1 / 110.54;                    // ~2 km GOES pixel
         const dLon = 1 / (111.32 * Math.cos(lat * Math.PI / 180));
         const r = L.rectangle([[lat - dLat, lon - dLon], [lat + dLat, lon + dLon]], goesStyle(h));
