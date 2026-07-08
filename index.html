@@ -451,7 +451,7 @@
       if (lastFireUpdate) {
         let fire = `Fires: ${firePoints.length} active in Idaho (NIFC, updated ${lastFireUpdate.toLocaleTimeString()})`;
         if (satStats) fire += ` · ${satStats.count} satellite detections ≤96h` +
-          (satStats.count ? `, newest ${satStats.newestHours}h ago (NASA FIRMS)` : ' (NASA FIRMS)');
+          (satStats.count ? `, ${satStats.clusters} active cluster${satStats.clusters === 1 ? '' : 's'}, newest ${satStats.newestHours}h ago (NASA FIRMS)` : ' (NASA FIRMS)');
         bits.push(fire);
       }
       el.textContent = bits.join(' · ');
@@ -480,6 +480,44 @@
       return { color: '#533720', weight: 1, fillColor: '#674528', fillOpacity: 0.3 };
     }
 
+    // Cluster fresh detections and outline each cluster (mimics WFCA's "SoF Clusters" look)
+    function clusterDetections(points, kmThresh) {
+      const parent = points.map((_, i) => i);
+      const find = i => parent[i] === i ? i : (parent[i] = find(parent[i]));
+      const dKm = (a, b) => {
+        const dy = (a[0] - b[0]) * 110.54;
+        const dx = (a[1] - b[1]) * 111.32 * Math.cos(a[0] * Math.PI / 180);
+        return Math.hypot(dx, dy);
+      };
+      for (let i = 0; i < points.length; i++) {
+        for (let j = i + 1; j < points.length; j++) {
+          if (dKm(points[i], points[j]) <= kmThresh) parent[find(i)] = find(j);
+        }
+      }
+      const groups = new Map();
+      points.forEach((p, i) => {
+        const r = find(i);
+        if (!groups.has(r)) groups.set(r, []);
+        groups.get(r).push(p);
+      });
+      return Array.from(groups.values());
+    }
+
+    function convexHull(points) { // monotone chain; points as [lat, lon]
+      const pts = points.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+      if (pts.length < 3) return null;
+      const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+      const half = dir => {
+        const out = [];
+        for (const p of (dir === 1 ? pts : pts.slice().reverse())) {
+          while (out.length >= 2 && cross(out[out.length - 2], out[out.length - 1], p) <= 0) out.pop();
+          out.push(p);
+        }
+        return out.slice(0, -1);
+      };
+      return half(1).concat(half(-1));
+    }
+
     function buildSatLayer(geojson) {
       const rects = (geojson.features || []).map(f => {
         const p = f.properties;
@@ -492,9 +530,24 @@
           `${p.hours_old}h ago · FRP ${p.frp ?? '?'} · ${escapeHtml(String(p.confidence || ''))}`, { sticky: true });
         return r;
       });
+      // Dashed cyan outlines around clusters of fresh detections (WFCA SoF-cluster style)
+      const fresh = (geojson.features || [])
+        .filter(f => f.properties.hours_old <= 24)
+        .map(f => [f.geometry.coordinates[1], f.geometry.coordinates[0]]);
+      const hulls = [];
+      clusterDetections(fresh, 2).forEach(group => {
+        const hull = convexHull(group);
+        if (!hull) return;
+        const poly = L.polygon(hull, {
+          color: '#00b4c8', weight: 2, dashArray: '4 3',
+          fillColor: '#00c8dc', fillOpacity: 0.15
+        });
+        poly.bindTooltip(`Active detection cluster · ${group.length} detections <24h`, { sticky: true });
+        hulls.push(poly);
+      });
       const hours = (geojson.features || []).map(f => f.properties.hours_old).filter(h => h != null);
-      satStats = { count: rects.length, newestHours: hours.length ? Math.min(...hours) : null };
-      return L.layerGroup(rects);
+      satStats = { count: rects.length, newestHours: hours.length ? Math.min(...hours) : null, clusters: hulls.length };
+      return L.layerGroup([...hulls, ...rects]);
     }
 
     async function refreshFires() {

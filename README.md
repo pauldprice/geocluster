@@ -36,6 +36,7 @@ An interactive web application for geographic clustering and labeling of househo
 - **Ada County live status**: 542 Ada County zones (Genasys Protect) with live evacuation status polled every 60s for zones containing your households and zones at fire locations; non-Normal zones turn status-colored with an alert banner (click it to jump to the zone)
 - **Active fires**: Idaho wildfire locations and perimeters from NIFC, refreshed every 5 minutes, with a "Fires" toggle
 - **Satellite fire footprints**: NASA FIRMS (VIIRS) thermal detections rendered as red footprint polygons over the burn area, age-banded (bright red <24h, darker as detections age to 96h) - shows the active fire area even before an official perimeter is published
+- **Active fire clusters**: detections under 24h are clustered (within ~2 km) and outlined with a dashed cyan hull, marking each actively burning area
 - **Geocode warnings**: households sharing identical coordinates (geocoder fallbacks) get a red dashed ring, households outside all zones get an amber dashed ring, and rows without coordinates are counted in the legend
 - **Data source**: See `data/README.md` for the ArcGIS feature service and how to refresh the data
 
