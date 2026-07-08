@@ -169,9 +169,10 @@
     // Boise County's own Ready/Set/Go renderer colors
     const READINESS_COLORS = { Ready: '#85e71d', Set: '#fcec0a', Go: '#cc1714' };
     const READINESS_LABELS = { Ready: 'READY – be aware', Set: 'SET – be ready to leave', Go: 'GO – evacuate now' };
-    let firesLayer = null, perimetersLayer = null, satLayer = null;
+    let firesLayer = null, perimetersLayer = null, satLayer = null, goesLayer = null;
     let firePoints = [];                   // [{lon, lat, name}] for live-status lookups
     let satStats = null;                   // {count, newestHours} for the status line
+    let goesStats = null;                  // {count, newestMin} for the status line
     let lastFireUpdate = null, lastStatusUpdate = null, pollBusy = false;
     const palette = [
       '#2563eb', '#16a34a', '#f59e0b', '#e11d48', '#0ea5e9', '#a855f7',
@@ -452,6 +453,7 @@
         let fire = `Fires: ${firePoints.length} active in Idaho (NIFC, updated ${lastFireUpdate.toLocaleTimeString()})`;
         if (satStats) fire += ` · ${satStats.count} satellite detections ≤96h` +
           (satStats.count ? `, ${satStats.clusters} active cluster${satStats.clusters === 1 ? '' : 's'}, newest ${satStats.newestHours}h ago (NASA FIRMS)` : ' (NASA FIRMS)');
+        if (goesStats && goesStats.count) fire += ` · ${goesStats.count} GOES ≤6h, newest ${goesStats.newestMin}min (NOAA HMS)`;
         bits.push(fire);
       }
       el.textContent = bits.join(' · ');
@@ -472,6 +474,47 @@
       '&geometry=-117.25,41.98,-111.04,49.01&geometryType=esriGeometryEnvelope&inSR=4326' +
       '&spatialRel=esriSpatialRelIntersects' +
       '&outFields=satellite,confidence,frp,scan,track,hours_old&f=geojson';
+
+    // NOAA HMS (Hazard Mapping System): analyst-QC'd GOES detections, keyless, ~1-2h latency
+    const HMS_URL = 'https://services2.arcgis.com/C8EMgrsFcRFL6LrL/arcgis/rest/services/' +
+      'NOAA_Satellite_Fire_Detections_(v1)/FeatureServer/0/query' +
+      '?where=' + encodeURIComponent("Satellite IN ('GOES-EAST','GOES-WEST')") +
+      '&geometry=-117.25,41.98,-111.04,49.01&geometryType=esriGeometryEnvelope&inSR=4326' +
+      '&spatialRel=esriSpatialRelIntersects&outFields=YearDay,Time,Satellite,Method,FRP&f=geojson';
+
+    function hmsAgeHours(p) {
+      const yd = String(p.YearDay);                 // e.g. '2026189' = day 189 of 2026
+      const t = String(p.Time).padStart(4, '0');    // 'HHMM' UTC
+      const ts = Date.UTC(+yd.slice(0, 4), 0, 1) + (+yd.slice(4) - 1) * 86400000 +
+        (+t.slice(0, 2)) * 3600000 + (+t.slice(2)) * 60000;
+      return (Date.now() - ts) / 3600000;
+    }
+
+    function goesStyle(h) { // orange family to distinguish from red VIIRS footprints
+      if (h <= 2) return { color: '#c2410c', weight: 2, fillColor: '#f97316', fillOpacity: 0.4 };
+      if (h <= 6) return { color: '#9a3412', weight: 1.5, fillColor: '#ea580c', fillOpacity: 0.28 };
+      return { color: '#7c2d12', weight: 1, fillColor: '#c2410c', fillOpacity: 0.15 };
+    }
+
+    function buildGoesLayer(geojson) {
+      const rects = [];
+      let newest = Infinity;
+      (geojson.features || []).forEach(f => {
+        const p = f.properties;
+        const h = hmsAgeHours(p);
+        if (!Number.isFinite(h) || h > 6) return; // GOES is for recency; VIIRS covers history
+        newest = Math.min(newest, h);
+        const [lon, lat] = f.geometry.coordinates;
+        const dLat = 1 / 110.54;                    // ~2 km GOES pixel
+        const dLon = 1 / (111.32 * Math.cos(lat * Math.PI / 180));
+        const r = L.rectangle([[lat - dLat, lon - dLon], [lat + dLat, lon + dLon]], goesStyle(h));
+        const age = h < 2 ? `${Math.round(h * 60)} min` : `${Math.round(h)}h`;
+        r.bindTooltip(`GOES detection · ${escapeHtml(String(p.Satellite))} · ${age} ago · FRP ${p.FRP ?? '?'} (NOAA HMS)`, { sticky: true });
+        rects.push(r);
+      });
+      goesStats = { count: rects.length, newestMin: rects.length ? Math.round(newest * 60) : null };
+      return L.layerGroup(rects);
+    }
 
     // WFCA-style age banding for detection footprints
     function detectionStyle(hoursOld) {
@@ -552,15 +595,18 @@
 
     async function refreshFires() {
       try {
-        const [pts, perims, viirs] = await Promise.all([
+        const [pts, perims, viirs, goes] = await Promise.all([
           fetch(FIRES_URL).then(r => r.json()),
           fetch(PERIMS_URL).then(r => r.json()),
-          fetch(VIIRS_URL).then(r => r.json()).catch(() => null)
+          fetch(VIIRS_URL).then(r => r.json()).catch(() => null),
+          fetch(HMS_URL).then(r => r.json()).catch(() => null)
         ]);
         if (firesLayer) firesLayer.remove();
         if (perimetersLayer) perimetersLayer.remove();
         if (satLayer) satLayer.remove();
+        if (goesLayer) goesLayer.remove();
         satLayer = viirs ? buildSatLayer(viirs) : null;
+        goesLayer = goes ? buildGoesLayer(goes) : null;
         firePoints = (pts.features || []).map(f => ({
           lon: f.geometry.coordinates[0], lat: f.geometry.coordinates[1], name: f.properties.IncidentName
         }));
@@ -584,7 +630,8 @@
           onEachFeature: (f, layer) => layer.bindTooltip(`${f.properties.attr_IncidentName || 'Fire'} perimeter`, { sticky: true })
         });
         if (toggleFiresBtn.textContent === 'Hide') {
-          if (satLayer) satLayer.addTo(map); // under the markers
+          if (goesLayer) goesLayer.addTo(map);  // coarse GOES pixels underneath
+          if (satLayer) satLayer.addTo(map);    // finer VIIRS footprints on top
           firesLayer.addTo(map);
           perimetersLayer.addTo(map);
         }
@@ -598,7 +645,7 @@
     const toggleFiresBtn = document.getElementById('toggleFires');
     toggleFiresBtn.addEventListener('click', () => {
       const showing = firesLayer && map.hasLayer(firesLayer);
-      [firesLayer, perimetersLayer, satLayer].forEach(l => {
+      [firesLayer, perimetersLayer, satLayer, goesLayer].forEach(l => {
         if (!l) return;
         if (showing) map.removeLayer(l); else l.addTo(map);
       });

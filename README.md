@@ -37,6 +37,7 @@ An interactive web application for geographic clustering and labeling of househo
 - **Active fires**: Idaho wildfire locations and perimeters from NIFC, refreshed every 5 minutes, with a "Fires" toggle
 - **Satellite fire footprints**: NASA FIRMS (VIIRS) thermal detections rendered as red footprint polygons over the burn area, age-banded (bright red <24h, darker as detections age to 96h) - shows the active fire area even before an official perimeter is published
 - **Active fire clusters**: detections under 24h are clustered (within ~2 km) and outlined with a dashed cyan hull, marking each actively burning area
+- **GOES rapid detections**: geostationary GOES-East/West fire detections from NOAA's Hazard Mapping System (keyless), last 6 hours, drawn as orange ~2 km pixels - catches fresh heat between VIIRS satellite passes
 - **Geocode warnings**: households sharing identical coordinates (geocoder fallbacks) get a red dashed ring, households outside all zones get an amber dashed ring, and rows without coordinates are counted in the legend
 - **Data source**: See `data/README.md` for the ArcGIS feature service and how to refresh the data
 
