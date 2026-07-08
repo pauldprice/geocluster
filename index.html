@@ -90,6 +90,10 @@
         Fires:
         <button id="toggleFires" class="secondary">Hide</button>
       </span>
+      <span class="pill">
+        GOES:
+        <button id="toggleGoes" class="secondary">Hide</button>
+      </span>
       <span id="status" class="hint"></span>
     </div>
   </header>
@@ -490,10 +494,9 @@
       return (Date.now() - ts) / 3600000;
     }
 
-    function goesStyle(h) { // orange family to distinguish from red VIIRS footprints
-      if (h <= 2) return { color: '#c2410c', weight: 2, fillColor: '#f97316', fillOpacity: 0.4 };
-      if (h <= 6) return { color: '#9a3412', weight: 1.5, fillColor: '#ea580c', fillOpacity: 0.28 };
-      return { color: '#7c2d12', weight: 1, fillColor: '#c2410c', fillOpacity: 0.15 };
+    function goesStyle(h) { // light translucent orange: coarse 2km pixels, advisory only
+      if (h <= 2) return { color: '#f97316', opacity: 0.4, weight: 1, fillColor: '#fdba74', fillOpacity: 0.18 };
+      return { color: '#fdba74', opacity: 0.3, weight: 1, fillColor: '#fed7aa', fillOpacity: 0.10 };
     }
 
     function buildGoesLayer(geojson) {
@@ -629,8 +632,8 @@
           style: { color: '#b91c1c', weight: 2, dashArray: '4 3', fillColor: '#b91c1c', fillOpacity: 0.08 },
           onEachFeature: (f, layer) => layer.bindTooltip(`${f.properties.attr_IncidentName || 'Fire'} perimeter`, { sticky: true })
         });
+        if (toggleGoesBtn.textContent === 'Hide' && goesLayer) goesLayer.addTo(map); // coarse GOES pixels underneath
         if (toggleFiresBtn.textContent === 'Hide') {
-          if (goesLayer) goesLayer.addTo(map);  // coarse GOES pixels underneath
           if (satLayer) satLayer.addTo(map);    // finer VIIRS footprints on top
           firesLayer.addTo(map);
           perimetersLayer.addTo(map);
@@ -645,11 +648,20 @@
     const toggleFiresBtn = document.getElementById('toggleFires');
     toggleFiresBtn.addEventListener('click', () => {
       const showing = firesLayer && map.hasLayer(firesLayer);
-      [firesLayer, perimetersLayer, satLayer, goesLayer].forEach(l => {
+      [firesLayer, perimetersLayer, satLayer].forEach(l => {
         if (!l) return;
         if (showing) map.removeLayer(l); else l.addTo(map);
       });
       toggleFiresBtn.textContent = showing ? 'Show' : 'Hide';
+    });
+
+    const toggleGoesBtn = document.getElementById('toggleGoes');
+    toggleGoesBtn.addEventListener('click', () => {
+      const showing = goesLayer && map.hasLayer(goesLayer);
+      if (goesLayer) {
+        if (showing) map.removeLayer(goesLayer); else goesLayer.addTo(map);
+      }
+      toggleGoesBtn.textContent = showing ? 'Show' : 'Hide';
     });
     refreshFires();
     setInterval(refreshFires, 300000);
